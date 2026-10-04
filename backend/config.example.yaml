@@ -1,0 +1,25 @@
+# ai_bobao 运行配置模板 —— 复制成 config.yaml 后再填自己的值：
+#   cp config.example.yaml config.yaml
+#
+# 前端「设置」页保存到 config.yaml，保存后立即生效，无需重启。
+# 优先级：config.py 内置默认值 < config.yaml < 环境变量。
+# 环境变量前缀 AI_BAOBAO_（见 config.py 的 _ENV），只在容器/CI 里临时覆盖时用。
+
+llm:
+  base: https://api.openai.com      # OpenAI 兼容端点，不带 /v1
+  key: ""                           # 填你的 API Key；留空则 AI 功能不可用
+  model: gpt-4o-mini
+  timeout: 60
+collect:
+  interval_minutes: 10              # 定时抓取间隔（分钟）
+  fetch_limit: 10                   # 单个文章源每轮最多取多少条
+  keep_days: 60                     # 漏洞保留天数，超期自动舍弃，0 = 不按日期筛
+  auto_translate: true              # 入库时顺带把英文情报译成中文
+nuclei:
+  repo: projectdiscovery/nuclei-templates
+  ref: main
+  remote_limit: 20                  # 每轮从远程拉几个模板
+  fetch_remote: true                # 走 GitHub API 抽样（增量同步是主路径）
+  gen_templates: true               # 为收录漏洞生成 nuclei 模板
+  sync_enabled: true                # 定时任务自动同步模板库增量
+  sync_limit: 0                     # 单次同步最多入库几条，0 = 不限

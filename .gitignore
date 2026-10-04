@@ -1,0 +1,39 @@
+# ---- 本地配置（含明文 API Key），不要提交 ----
+backend/config.yaml
+backend/*.yaml.tmp
+.env
+.env.*
+!.env.example
+
+# ---- 运行时数据 ----
+backend/data/
+data/
+*.db
+*.sqlite3
+
+# ---- 抓取缓存 / 临时产物 ----
+.tmp/
+*.log
+
+# npm 误在 backend 下生成的空壳，无用
+backend/package-lock.json
+
+# ---- 前端 ----
+frontend/node_modules/
+frontend/dist/
+
+# ---- 第三方源码（nuclei 本体，非本项目代码）----
+/nuclei/
+
+# ---- Python ----
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+.pytest_cache/
+
+# ---- 编辑器 / 系统 ----
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
