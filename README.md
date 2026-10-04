@@ -10,7 +10,7 @@ AI 赋能的漏洞播报系统，AI 根据公开的漏洞思路自动生成 PoC�
 
 #### 预览图
 
-![界面预览](https://raw.githubusercontent.com/wr0x00/ai_bobao/main/image.png)
+![界面预览](image.png)
 
 ## 特性
 
@@ -125,7 +125,7 @@ curl -X POST localhost:8100/api/nuclei/pull -d '{"limit": 20}'      # 拉取入�
 
 ## 接入新漏洞源
 
-![接入新漏洞源](https://raw.githubusercontent.com/wr0x00/ai_bobao/main/image2.png)
+![接入新漏洞源](image2.png)
 
 设置页填一个社区首页即可，系统自动完成探测与判活：先按常见路径（`/feed`、`/rss`、`/rss.xml`、`/atom.xml` …）逐个试，解析得出条目的即为 feed；��[...] 
 
