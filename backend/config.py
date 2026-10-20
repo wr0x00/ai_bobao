@@ -1,12 +1,18 @@
 """config.py —— 全局配置。优先读 config.yaml（前端可改），环境变量可覆盖单条。
 
 新增配置项只改 DEFAULTS + config.yaml，不用改这里。
+
+配置里有两个值会直接进入网络请求（llm.base）和 git 命令（nuclei.repo / ref），
+所以在 _validate 里就卡死形状：地址只允许 http/https，仓库名必须是 owner/repo，
+分支名不能以 "-" 开头（会被 git 当成命令行选项）。
 """
 import os
 import threading
 from pathlib import Path
 
 import yaml
+
+import security
 
 BASE_DIR = Path(__file__).resolve().parent
 DATA_DIR = BASE_DIR / "data"
@@ -118,6 +124,7 @@ def get(section: str, key: str):
 
 
 def _validate(section: str, key: str, value):
+    """校验并规范一个配置项的值。返回规范化后的值，不合格就抛 ValueError。"""
     path = (section, key)
     if path in _INT_KEYS:
         value = int(value)
@@ -130,10 +137,17 @@ def _validate(section: str, key: str, value):
         value = bool(value)
     elif key in ("base", "key", "model", "repo", "ref"):
         value = str(value).strip()
-    if path == ("llm", "base") and value and not value.startswith(("http://", "https://")):
-        raise ValueError("接口地址必须以 http:// 或 https:// 开头")
+    if path == ("llm", "base"):
+        # 这里只做形状检查，不做 DNS 解析 —— 保存设置不该要求联网。
+        # 真正拦内网地址的是 llm.chat 里的 security.check_url，发请求前才查。
+        if value and not security.is_http_url(value):
+            raise ValueError("接口地址必须是 http:// 或 https:// 开头的完整网址")
     if path == ("llm", "model") and not value:
         raise ValueError("模型名不能为空")
+    if path == ("nuclei", "repo") and not security.valid_repo(value):
+        raise ValueError("模板库仓库名要写成 owner/repo 的形式")
+    if path == ("nuclei", "ref") and not security.valid_ref(value):
+        raise ValueError("模板库分支名不合法")
     return value
 
 

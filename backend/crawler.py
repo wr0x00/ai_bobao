@@ -4,21 +4,25 @@
 - 每个 feed / 每篇文章都有硬性墙钟死线（线程 + join），涓流响应拖不死流水线
 - 单源失败只打告警，绝不影响其他源；正文爬不动返回空，绝不抛异常
 - PoC 提取规则：页面里 <pre>/<code> 块长度>80 且含代码特征 → 视为现成 PoC
+
+出站安全：所有对外请求统一走 security.open_url。它负责拦内网地址、
+逐跳校验重定向、限制响应体大小、校验服务器证书（默认开）。
+文章正文地址来自 feed 内容，同样是不可信输入，一并由它挡。
 """
 import hashlib
+import logging
 import re
-import ssl
 import threading
-import urllib.request
-import xml.etree.ElementTree as ET
 from email.utils import parsedate_to_datetime
 
 import config
+import security
+
+logger = logging.getLogger("ai_bobao.crawler")
 
 DEADLINE = 25      # 硬死线（秒）
-
-# 免证书校验：部分站点（seebug 等）证书链在本地验证不过，demo 用途直接跳过校验
-_SSL_CTX = ssl._create_unverified_context()
+MAX_FEED = 4 * 1024 * 1024     # feed 响应上限 4MB
+MAX_ARTICLE = 8 * 1024 * 1024  # 文章正文响应上限 8MB
 
 # freebuf 整站有阿里云 WAF JS 挑战，纯 HTTP 爬不动（需无头浏览器），故不列；
 # packetstorm 的 feed 返回残缺 XML，也移除；
@@ -56,11 +60,15 @@ def _with_deadline(fn, timeout: float = DEADLINE):
     return result["data"]
 
 
-def _http_get(url: str, timeout: float = 20) -> bytes:
-    req = urllib.request.Request(
-        url, headers={"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) Chrome/130.0.0.0"})
-    with urllib.request.urlopen(req, timeout=timeout, context=_SSL_CTX) as r:
-        return r.read()
+def _http_get(url: str, timeout: float = 20, max_bytes: int = MAX_FEED) -> bytes:
+    """取一个 URL 的内容。走安全网关，内网地址、证书问题、超大响应都会被挡下。"""
+    return security.open_url(
+        url,
+        timeout=timeout,
+        max_bytes=max_bytes,
+        headers={"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) Chrome/130.0.0.0",
+                 "Accept": "*/*"},
+    )
 
 
 def _mk(source: str, title: str, link: str, desc: str, pub: str) -> dict:
@@ -79,7 +87,7 @@ def _mk(source: str, title: str, link: str, desc: str, pub: str) -> dict:
 
 
 def _parse_feed(raw: bytes, source: str) -> list[dict]:
-    root = ET.fromstring(raw)
+    root = security.parse_xml(raw, MAX_FEED)
     out = []
     for it in root.iter("item"):  # RSS 2.0
         out.append(_mk(source, it.findtext("title"), (it.findtext("link") or "").strip(),
@@ -115,10 +123,10 @@ def fetch_articles() -> list[dict]:
     for name, url in all_feeds():
         try:
             got = _with_deadline(lambda u=url: _parse_feed(_http_get(u), name))
-            print(f"[crawler] {name} → {len(got)} 篇")
+            logger.info("%s → %d 篇", name, len(got))
             items.extend(got[:limit])
         except Exception as e:  # noqa: BLE001
-            print(f"[crawler] {name} 失败: {e!r}")
+            logger.warning("%s 抓取失败：%r", name, e)
     seen, uniq = set(), []
     for it in items:
         if it["id"] not in seen and it["title"]:
@@ -128,13 +136,17 @@ def fetch_articles() -> list[dict]:
 
 
 def fetch_article_content(link: str) -> tuple[str, str | None]:
-    """抓文章正文 → (纯文本, 现成PoC或None)。爬不动返回 ("", None)。"""
+    """抓文章正文 → (纯文本, 现成PoC或None)。爬不动返回 ("", None)。
+
+    link 来自 feed 内容，站点作者写什么我们就得去什么，所以它是不可信输入。
+    交给安全网关去挡：内网地址、带账号密码的地址、超大响应都拿不到。
+    """
     if not link:
         return "", None
     try:
-        raw = _with_deadline(lambda: _http_get(link), timeout=DEADLINE)
+        raw = _with_deadline(lambda: _http_get(link, max_bytes=MAX_ARTICLE), timeout=DEADLINE)
     except Exception as e:  # noqa: BLE001
-        print(f"[crawler] 正文失败 {link[:60]}: {e!r}")
+        logger.warning("正文抓取失败 %s：%r", link[:60], e)
         return "", None
     html = raw.decode("utf-8", "replace")
     blocks = [_TAG.sub("", m.group(2)) for m in _BLOCK.finditer(html)]

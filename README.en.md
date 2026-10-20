@@ -11,12 +11,15 @@ An AI-powered vulnerability broadcast system that monitors vulnerability disclos
 ## Features
 
 - **Multi-source aggregation** — Concurrently fetches RSS feeds and article bodies from Seebug, Xianzhi (Aliyun Xianzhi) and Exploit-DB. A single source failure never blocks the pipeline; every request is bounded by a hard timeout.
+- **AI content triage** — Every fetched article is first handed to the LLM to be classified: only real vulnerability intelligence is kept, while CTF write-ups, tutorials and industry news are dropped.
 - **Self-service onboarding** — Paste a community URL in Settings; the system probes its feeds, has the LLM confirm it is a vulnerability community, and starts crawling it once you accept.
 - **AI enrichment** — An LLM turns raw articles into structured intelligence: name, summary, root cause and attack surface. Existing PoCs are kept verbatim; missing ones are written from the publicly disclosed exploitation logic.
 - **Bidirectional nuclei bridge** — Recorded vulnerabilities can be exported as nuclei v3 templates, and new upstream templates can be synced in incrementally.
 - **Automatic localization** — English intelligence and template metadata are translated to Simplified Chinese, preserving CVE IDs, component names and function names.
+- **Library overview** — Horizontal bar chart of component counts and a multi-color donut of platform distribution.
+- **One-click update** — The Settings page checks GitHub for a newer release and fast-forwards to it on demand.
 - **File-based storage** — No database dependency. One directory per vulnerability; swapping the storage engine only touches `store.py`.
-- **Web console** — Vulnerability list, detail view, template library and online settings, with a background scheduler and a live countdown.
+- **Web console** — Vulnerability list, detail view, overview, template library and online settings, with a background scheduler and a live countdown.
 
 ## Stack
 
@@ -74,16 +77,20 @@ backend/
   sources.py      Source aggregation: article feeds + nuclei templates
   source_discovery.py  New community onboarding: feed probing + AI vetting
   analyzer.py     AI layer: enrichment, PoC generation, sync orchestration
+  content_judge.py  Content triage: let the LLM tell vulnerabilities from articles
   translate.py    Chinese localization and bulk backfill
   nuclei_tpl.py   PoC → nuclei template generation (structured JSON + YAML assembly)
   nuclei_sync.py  Incremental git sync of nuclei-templates
   store.py        File-based storage layer
   llm.py          OpenAI-compatible client
+  security.py     Outbound security gateway (SSRF guard, hardened XML, rate limiting)
+  updater.py      Self-update: check GitHub for a new release and fast-forward
   data/           Runtime data (git-ignored)
 frontend/
   src/
     ListView.vue      Vulnerability list
     DetailView.vue    Vulnerability detail
+    OverviewView.vue  Library overview (bar chart + donut)
     TemplatesView.vue Template library
     SettingsView.vue  Settings
 ```
@@ -91,13 +98,41 @@ frontend/
 ## Pipeline
 
 ```
-RSS feeds ──► crawler ──► analyzer ──► store ──► translate
-                │            │                      │
-                │            └──► nuclei_tpl ──► data/nuclei_tpl
+RSS feeds ──► crawler ──► content_judge ──► analyzer ──► store ──► translate
+                │              │                │                      │
+                │              │                └──► nuclei_tpl ──► data/nuclei_tpl
+                │              └──► classified as an article → dropped
                 └──► nuclei_sync ◄── nuclei-templates
 ```
 
 Each cycle syncs upstream template increments first, then runs the article pipeline, and finally purges entries older than `keep_days`. Collection and template sync are individually locked so manual triggers cannot collide with the scheduler.
+
+## Content Triage: Intelligence vs. Articles
+
+Vulnerability communities are full of things that are not vulnerabilities — CTF write-ups, contest solution posts, reverse-engineering tutorials, industry news, tool reviews. Filtering by date alone broadcasts all of them.
+
+So every article is classified by the LLM right after its body is fetched (`content_judge.py`):
+
+| Verdict | Meaning | Action |
+| --- | --- | --- |
+| `vuln` | A concrete flaw in a product or component, with root cause, affected versions and exploitation | Keep |
+| `writeup` | Contest write-up or post-event reproduction | Drop |
+| `tutorial` | General technical tutorial or primer | Drop |
+| `tool` | Introduction to a tool, framework or scanner | Drop |
+| `news` | Industry reporting, opinion piece, event announcement | Drop |
+| `other` / `unknown` | Unclear, or the model gave no conclusion | Drop |
+
+Guiding rules:
+
+- **No hardcoded regexes or keyword lists.** Fixed rules always leak and always misfire; letting the model decide what counts as a vulnerability is far more reliable.
+- **No verdict means no entry.** When the model is unavailable (timeout, 5xx) the item is skipped this round and retried later. Under-collecting is preferred over mis-collecting.
+- **Fallback entries are dropped too.** The old code forced a stub entry with a "（兜底）" suffix into the library; those are now discarded.
+- **The existing library can be re-checked.** "复检存量内容" in Settings runs the same triage over stored entries, deletes the non-vulnerabilities and rewrites the old fallbacks.
+
+```bash
+# Re-check the whole library (limit=0 means no cap)
+curl -X POST localhost:8100/api/vulns/recheck -d '{"limit": 0}'
+```
 
 ## nuclei Bridge
 
@@ -153,9 +188,13 @@ Notes:
 | POST | `/api/vulns/{id}/translate` | Translate a single entry to Chinese |
 | POST | `/api/vulns/{id}/nuclei` | Generate a nuclei template |
 | POST | `/api/vulns/purge` | Purge entries older than `keep_days` |
+| POST | `/api/vulns/recheck` | Re-check stored entries: drop non-vulnerabilities, rewrite fallbacks |
+| GET | `/api/stats` | Library statistics (total / last 7 days / with template / translated) |
 | POST | `/api/translate/backfill` | Bulk translation; pass `ids` to limit scope |
 | POST | `/api/collect` | Trigger a collection cycle |
 | GET | `/api/collect/status` | Collection status and next run time |
+| GET | `/api/update/check` | Check whether GitHub has a newer release |
+| POST | `/api/update/apply` | Pull the latest release (fast-forward only, refuses on local changes) |
 | GET/POST | `/api/nuclei/sync` | Sync status / trigger a sync |
 | GET | `/api/nuclei/templates` | Local template library |
 | GET | `/api/nuclei/remote` | Preview the upstream library |

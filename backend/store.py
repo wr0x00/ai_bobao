@@ -8,20 +8,52 @@ data/vulns/{漏洞ID}/
 data/nuclei_tpl/   所有模板的汇总目录，可直接 `nuclei -l data/nuclei_tpl` 跑
 列表 = 扫目录读 meta.json；详情 = 目录名 → meta + poc 全文 + 模板。
 以后换数据库只需重写本文件的几个函数，其他层不动。
+
+路径安全：漏洞 ID 一律经 security.require_vid 校验，meta.json 里回读的
+poc_file 一律当不可信输入处理（限定 poc.<白名单后缀> 且必须在漏洞目录内）。
 """
 import json
+import logging
 import re
 import shutil
+import threading
+import time
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
+import security
 from config import NUCLEI_TPL_DIR, VULN_DIR
 
-_SAFE = re.compile(r"[^A-Za-z0-9._-]+")  # 目录名白名单，防路径穿越
+logger = logging.getLogger("ai_bobao.store")
+
 _CVE_YEAR = re.compile(r"CVE-(\d{4})", re.I)
 _DATE_RE = re.compile(r"(\d{4})-(\d{2})-(\d{2})")
 _HAS_ZH = re.compile(r"[\u4e00-\u9fff]")
 _FALLBACK_MARK = "（兜底）"   # llm_generate 兜底时拼在标题末尾的标记
+
+# PoC 文件允许的后缀。poc_lang 会直接拼进文件名并落到磁盘上，不设白名单的话
+# 一个 "../.." 就能把文件写到漏洞目录外面去。
+_POC_LANGS = frozenset({"python", "py", "txt", "http", "md"})
+_POC_FILE_RE = re.compile(r"^poc\.(python|py|txt|http|md)$")
+
+# 组件名提取用的规则。nuclei 模板的 id 长这样：
+#   "WordPress Plugin Elementor 3.5.0 - XSS"
+#   "CVE-2024-12345 - Apache HTTP Server 路径遍历"
+# 先按分隔符砍掉后半段的"漏洞类型"，再砍掉版本号和编号，剩下的就是组件名。
+# 这只是统计口径（总览页按组件分组），不参与"这条要不要收录"的判断——
+# 收录与否一律由 content_judge 交给模型判。
+_VER_RE = re.compile(r"\s+v?\d+(?:\.\d+){1,4}(?:[-.]\w+)*\s*$")   # 末尾版本号 3.5.0 / v2.1
+_CMP_RE = re.compile(r"[\s<>=~^]+$")                    # 砍完版本号剩下的 "<=" ">" "~" 之类
+_CVE_RE = re.compile(r"\bCVE-\d{4}-\d+\b", re.I)
+_CNAF_RE = re.compile(r"\b(CNAF|CNVD|CNNVD|CNNVD)-[\d\-]+\b", re.I)
+_LEAD_TYPE_RE = re.compile(
+    r"^(HTTP|SSL|TLS|DNS|TCP|FTP|SMB|SSH|WebSocket|RPC|SOAP|PAN|GPON|CVE|GHSA|DNN)\b[:\s]*", re.I)
+
+# 列表缓存。_load_rows 每次要读完 200 多个 meta.json，列表页翻页和状态页轮询
+# 都靠它，短缓存能省掉大量重复 IO。写操作（save / purge）会主动失效。
+_ROW_CACHE_TTL = 10.0
+_rows_cache: dict = {"at": 0.0, "rows": []}
+_rows_lock = threading.Lock()
 
 
 def is_zh_name(name: str) -> bool:
@@ -74,28 +106,75 @@ def too_old(meta: dict, keep_days: int) -> bool:
         return False
 
 
+def component_of(name: str, vid: str = "") -> str:
+    """从标题里量出"这是哪个组件的漏洞"，量不出就返回空串。
+
+    只用于统计分组：老条目入库时还没有 component 字段（那时还没让模型判），
+    总览页要把它们和 nuclei 模板条目放在同一张图上，就在这儿按标题切一刀。
+    切完还剩不出东西的返回空串，由调用方落到"未分类"。
+    """
+    raw = (name or "").strip()
+    if not raw:
+        return ""
+    # nuclei 模板的 id 形如 "WordPress Plugin Elementor 3.5.0 - XSS"，
+    # " - " 后面基本是漏洞类型（XSS / RCE / 路径遍历），前面才是组件
+    head = re.split(r"\s+[-–—]\s+", raw)[0]
+    head = _CVE_RE.sub(" ", head)
+    head = _CNAF_RE.sub(" ", head)
+    head = _LEAD_TYPE_RE.sub("", head)
+    head = _VER_RE.sub("", head)
+    head = _CMP_RE.sub("", head)              # "SiYuan <=0.58" 砍完版本号还剩个 "<="
+    head = re.sub(r"[（(].*?[)）]", " ", head)      # 括注一般是说明，不是组件名
+    head = re.sub(r"\s{2,}", " ", head).strip(" -–—:：,，、")
+    # 砍完太短说明切错了（多半整段都是编号），这种宁可归"未分类"
+    return head[:60] if len(head) >= 3 else ""
+
+
 def _dump(d: Path, meta: dict) -> None:
     (d / "meta.json").write_text(
         json.dumps(meta, ensure_ascii=False, indent=2), encoding="utf-8")
 
 
 def save(meta: dict, poc: str, poc_lang: str = "python", nuclei_yaml: str = "") -> str:
-    vid = _SAFE.sub("_", meta["id"])
-    d = VULN_DIR / vid
+    """把一条漏洞写进文件库，返回最终用的漏洞 ID。
+
+    目录名由 security.normalize_vid 从原始 ID 归一化而来（非法字符换下划线、
+    截断到 120 字符），文件名后缀走 _POC_LANGS 白名单。两道都过了才落盘，
+    免得 meta["id"] 或 poc_lang 里带一个 ".." 就把文件写到数据目录外面。
+    """
+    vid = security.normalize_vid(meta["id"])
+    if not vid:
+        raise ValueError("漏洞 ID 归一化之后是空的")
+    lang = (poc_lang or "python").lower().strip().lstrip(".")
+    if lang not in _POC_LANGS:
+        lang = "python"                      # 认不出来的后缀一律按 python 存，别拼进路径
+
+    d = security.safe_join(VULN_DIR, vid)
     d.mkdir(parents=True, exist_ok=True)
-    meta = {**meta, "id": vid, "poc_file": f"poc.{poc_lang}",
+    meta = {**meta, "id": vid, "poc_file": f"poc.{lang}",
             "created_at": meta.get("created_at") or _now()}
-    (d / f"poc.{poc_lang}").write_text(poc, encoding="utf-8")
+    (d / f"poc.{lang}").write_text(poc, encoding="utf-8")
     if nuclei_yaml:
         meta["nuclei_file"] = "nuclei.yaml"
         (d / "nuclei.yaml").write_text(nuclei_yaml, encoding="utf-8")
         NUCLEI_TPL_DIR.mkdir(parents=True, exist_ok=True)   # 汇总一份，整体可 nuclei -l 跑
-        shutil.copyfile(d / "nuclei.yaml", NUCLEI_TPL_DIR / f"{vid}.yaml")
+        shutil.copyfile(d / "nuclei.yaml", security.safe_join(NUCLEI_TPL_DIR, f"{vid}.yaml"))
     _dump(d, meta)
+    invalidate_rows()
     return vid
 
 
-def _load_rows() -> list[dict]:
+def _read_text(path: Path, limit: int = 4 * 1024 * 1024) -> str:
+    """读文本，坏编码按替换处理。单文件超过 limit 就当没有，省得一条坏数据吃光内存。"""
+    try:
+        if path.stat().st_size > limit:
+            return ""
+        return path.read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return ""
+
+
+def _load_rows_uncached() -> list[dict]:
     """全量读 meta.json，附带排序用的日期。列表页和筛选都基于它。"""
     rows = []
     if not VULN_DIR.exists():
@@ -108,12 +187,23 @@ def _load_rows() -> list[dict]:
             m = json.loads(f.read_text(encoding="utf-8"))
         except Exception:  # noqa: BLE001 —— 单条坏文件不该让整个列表打不开
             continue
+        if not isinstance(m, dict) or not m.get("id"):
+            continue
         date, year_only = entry_date(m)
         name = m.get("name") or m["id"]
+        # 组件名三条来源：判定时模型给的 component、老条目从标题里量的，
+        # 都没有就显示"未分类"——总览页的条形图按它分组。
+        component = str(m.get("component") or "").strip()[:80] \
+            or component_of(name, m.get("id", "")) or "未分类"
+        # 关键词检索用的合并文本，只在列表页内部用，不返回给前端
+        _text = " ".join(str(m.get(k) or "") for k in
+                         ("id", "name", "summary", "principle")).lower()
         rows.append({"id": m["id"], "name": name,
-                     "source": m.get("source", "-"),
-                     "summary": m.get("summary", ""),
-                     "published": m.get("published", ""),
+                     "source": str(m.get("source") or "-")[:100],
+                     "component": component,
+                     "poc_source": str(m.get("poc_source") or "")[:20],
+                     "summary": str(m.get("summary") or ""),
+                     "published": str(m.get("published") or ""),
                      "cvss": m.get("cvss"),
                      # translated 只说明"是 LLM 翻的"；老条目没这个标记但本来就是中文，
                      # 所以额外看一眼标题有没有汉字，不然列表页会给中文标题挂 EN 角标
@@ -121,29 +211,58 @@ def _load_rows() -> list[dict]:
                      "has_nuclei": (d / "nuclei.yaml").is_file(),
                      # 编号里只有年份时只显示年份，别拿 12-31 糊弄用户
                      "entry_date": date[:4] if year_only else date,
-                     "entry_iso": date or (m.get("created_at") or "")[:10]})
+                     "entry_iso": date or (m.get("created_at") or "")[:10],
+                     "_text": _text})
     rows.sort(key=lambda x: x["entry_iso"], reverse=True)   # 新的在前
     return rows
 
 
-def list_vulns(page: int = 1, page_size: int = 10, source: str = "") -> dict:
+def invalidate_rows() -> None:
+    """写完盘就把列表缓存丢掉。抓取任务和列表页并发是常态，不失效会看到旧数据。
+
+    对外公开是因为 translate.py 也会改 meta.json，改完一样得让列表刷新。
+    """
+    with _rows_lock:
+        _rows_cache["at"] = 0.0
+        _rows_cache["rows"] = []
+
+
+def _load_rows() -> list[dict]:
+    """带 10 秒缓存的全量行。返回的是同一份 list，调用方只读不改。"""
+    with _rows_lock:
+        if time.monotonic() - _rows_cache["at"] <= _ROW_CACHE_TTL:
+            return _rows_cache["rows"]
+    rows = _load_rows_uncached()          # 锁外读盘，慢的那部分不占着锁
+    with _rows_lock:
+        _rows_cache["rows"] = rows
+        _rows_cache["at"] = time.monotonic()
+    return rows
+
+
+
+def list_vulns(page: int = 1, page_size: int = 10, source: str = "", q: str = "") -> dict:
     """分页列表。返回 {items, total, page, pages, page_size, all_total, counts}。
 
     前端只渲染当前页，一次传 4000 条没必要。counts 是全库按来源的计数，
-    切页签时徽标数字不受分页影响。
+    切页签时徽标数字不受分页影响。q 是关键词，在标题/编号/简介/原理里匹配，
+    空格分隔的多个词要全部命中（AND）；counts 始终是全库计数，不随关键词变。
     """
     rows = _load_rows()
     counts: dict[str, int] = {}
     for r in rows:
         counts[r["source"]] = counts.get(r["source"], 0) + 1
     grand_total = len(rows)
+    words = [w for w in q.lower().split() if w]
+    if words:
+        rows = [r for r in rows if all(w in r["_text"] for w in words)]
     if source and source != "全部":
         rows = [r for r in rows if r["source"] == source]
     total = len(rows)
     page_size = max(1, min(int(page_size or 10), 100))
     pages = max(1, -(-total // page_size))       # 向上取整
     page = max(1, min(int(page or 1), pages))
-    items = rows[(page - 1) * page_size: page * page_size]
+    items = [{k: v for k, v in r.items() if k != "_text"}
+             for r in rows[(page - 1) * page_size: page * page_size]]
     return {"items": items, "total": total, "page": page, "pages": pages,
             "page_size": page_size, "all_total": grand_total, "counts": counts}
 
@@ -153,6 +272,8 @@ def purge_expired(keep_days: int) -> dict:
 
     判定直接复用 too_old，别自己再写一遍日期逻辑，两边一旦不一致就会出现
     "列表里还留着过期条目"的漏网之鱼。
+
+    删完必须让列表缓存失效，不然前端十秒内还能看到已经删掉的条目。
     """
     if keep_days <= 0 or not VULN_DIR.exists():
         return {"removed": 0, "ids": [], "failed": []}
@@ -164,24 +285,40 @@ def purge_expired(keep_days: int) -> dict:
             continue
         try:
             m = json.loads(f.read_text(encoding="utf-8"))
-        except Exception:  # noqa: BLE001
+        except (OSError, ValueError):
             continue
-        if not too_old(m, keep_days):
+        if not isinstance(m, dict) or not too_old(m, keep_days):
             continue
-        vid = m.get("id", d.name)
+        vid = str(m.get("id") or d.name)
         # 不能用 ignore_errors：文件被占用时它会静默跳过，删不掉却照样报成功，
         # 结果是过期条目留在库里，下一轮又被抓回来，抖个没完。
         try:
             shutil.rmtree(d)
         except OSError as e:
             failed.append(vid)
-            print(f"[purge] {vid} 删不掉（{e.strerror or e}），可能正被占用")
+            logger.warning("漏洞 %s 删不掉（%s），可能正被占用", vid, e.strerror or e)
             continue
-        (NUCLEI_TPL_DIR / f"{_SAFE.sub('_', vid)}.yaml").unlink(missing_ok=True)
+        _remove_summary_tpl(vid)
         ids.append(vid)
     if ids:
-        print(f"[purge] 清理过期漏洞 {len(ids)} 条（早于 {cutoff}）")
+        logger.info("清理过期漏洞 %s 条（早于 %s）", len(ids), cutoff)
+        invalidate_rows()
     return {"removed": len(ids), "ids": ids, "failed": failed}
+
+
+def _remove_summary_tpl(vid: str) -> None:
+    """删掉汇总模板目录里对应的 yaml。vid 来自 meta.json，不可信，重新归一化后再拼路径。"""
+    name = security.normalize_vid(vid)
+    if not name:
+        return
+    try:
+        path = security.safe_join(NUCLEI_TPL_DIR, f"{name}.yaml")
+    except security.SecurityError:
+        return
+    try:
+        path.unlink(missing_ok=True)
+    except OSError as e:
+        logger.warning("汇总模板 %s 删不掉：%s", name, e)
 
 
 def pending_translate_count() -> int:
@@ -212,13 +349,176 @@ def list_templates() -> list[dict]:
 
 
 def get_vuln(vid: str) -> dict | None:
-    d = VULN_DIR / _SAFE.sub("_", vid)
+    """读一条漏洞详情。不存在或 ID 不合法都返回 None。
+
+    meta.json 里的 poc_file 是回读字段——它写进去的时候是干净的，但文件库可能
+    被手工改过、也可能被别的程序写脏，所以这里不直接信任：只接受
+    poc.<白名单后缀> 这一个形状，再用 safe_join 确认拼出来的路径还在漏洞目录里。
+    两道都过才读，否则当成没有 PoC。
+    """
+    try:
+        vid = security.require_vid(vid)
+        d = security.safe_join(VULN_DIR, vid)
+    except security.SecurityError as e:
+        logger.warning("拒绝读取漏洞详情：%s", e)
+        return None
+
     f = d / "meta.json"
     if not f.is_file():
         return None
-    m = json.loads(f.read_text(encoding="utf-8"))
-    poc_path = d / m.get("poc_file", "poc.txt")
-    m["poc"] = poc_path.read_text(encoding="utf-8") if poc_path.is_file() else ""
-    tpl_path = d / "nuclei.yaml"
-    m["nuclei_yaml"] = tpl_path.read_text(encoding="utf-8") if tpl_path.is_file() else ""
+    try:
+        m = json.loads(f.read_text(encoding="utf-8"))
+    except (OSError, ValueError) as e:
+        logger.warning("漏洞 %s 的 meta.json 读不出来：%s", vid, e)
+        return None
+    if not isinstance(m, dict):
+        return None
+
+    m["id"] = str(m.get("id") or vid)
+    m["poc"] = _read_poc(d, m)
+    tpl_path = security.safe_join(d, "nuclei.yaml")
+    m["nuclei_yaml"] = _read_text(tpl_path) if tpl_path.is_file() else ""
+    m["refs"] = security.safe_refs(m.get("refs"))     # 只留 http/https，前端不用再判
     return m
+
+
+def _read_poc(d: Path, meta: dict) -> str:
+    """按 meta 里记的 poc_file 读 PoC 全文。文件名不合规就读默认的 poc.txt。"""
+    name = str(meta.get("poc_file") or "")
+    if not _POC_FILE_RE.match(name):
+        name = "poc.txt"
+    try:
+        path = security.safe_join(d, name)
+    except security.SecurityError:
+        return ""
+    return _read_text(path) if path.is_file() else ""
+
+
+# ---------------------------------------------------------------- 复检与统计
+
+def all_metas() -> list[dict]:
+    """全库 meta.json 的列表，按条目日期从新到旧排。
+
+    复检存量要用，不能走 _load_rows：那个是给列表页的精简行（没有正文、
+    原理这些判定要用的字段），而且带 10 秒缓存，复检要的是当下的全量。
+    """
+    metas = []
+    if not VULN_DIR.exists():
+        return metas
+    for d in VULN_DIR.iterdir():
+        f = d / "meta.json"
+        if not f.is_file():
+            continue
+        try:
+            m = json.loads(f.read_text(encoding="utf-8"))
+        except Exception:  # noqa: BLE001 —— 单条坏文件不该让整个复检中断
+            continue
+        if isinstance(m, dict) and m.get("id"):
+            m["_poc_text"] = _read_poc(d, m)
+            metas.append(m)
+    metas.sort(key=lambda x: str(x.get("created_at") or ""), reverse=True)
+    return metas
+
+
+def update_meta(vid: str, patch: dict) -> bool:
+    """只改 meta.json 里的几个字段，PoC 和 nuclei 模板一个字都不动。
+
+    复检补 component、重写兜底标题都走这里。别拿它做批量改写：patch 里的
+    键会原样覆盖，所以调用方自己负责别把 id / poc_file 塞进去。
+    """
+    try:
+        vid = security.require_vid(vid)
+        d = security.safe_join(VULN_DIR, vid)
+    except security.SecurityError as e:
+        logger.warning("拒绝改写 meta：%s", e)
+        return False
+    f = d / "meta.json"
+    if not f.is_file():
+        return False
+    try:
+        m = json.loads(f.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return False
+    if not isinstance(m, dict):
+        return False
+    m.update({k: v for k, v in patch.items() if k not in ("id", "poc_file")})
+    _dump(d, m)
+    invalidate_rows()
+    return True
+
+
+def save_poc(vid: str, poc: str, poc_lang: str = "python") -> bool:
+    """重写某条的 PoC 文件。文件名后缀跟 save 一样走白名单。"""
+    try:
+        vid = security.require_vid(vid)
+        d = security.safe_join(VULN_DIR, vid)
+    except security.SecurityError:
+        return False
+    if not (d / "meta.json").is_file():
+        return False
+    lang = (poc_lang or "python").lower().strip().lstrip(".")
+    if lang not in _POC_LANGS:
+        lang = "python"
+    try:
+        (d / f"poc.{lang}").write_text(poc, encoding="utf-8")
+    except OSError as e:
+        logger.warning("PoC 写不进 %s：%s", vid, e)
+        return False
+    update_meta(vid, {"poc_file": f"poc.{lang}"})
+    return True
+
+
+def delete_vuln(vid: str) -> bool:
+    """删掉一条漏洞：漏洞目录 + 汇总模板目录里的 yaml 一起清。
+
+    和 purge_expired 一样不用 ignore_errors：文件被占用时它会静默跳过，
+    表面删成功、实际条目还在库里，下一轮又被抓回来。
+    """
+    try:
+        vid = security.require_vid(vid)
+        d = security.safe_join(VULN_DIR, vid)
+    except security.SecurityError as e:
+        logger.warning("拒绝删除漏洞：%s", e)
+        return False
+    if not d.is_dir():
+        return False
+    try:
+        shutil.rmtree(d)
+    except OSError as e:
+        logger.warning("漏洞 %s 删不掉（%s），可能正被占用", vid, e.strerror or e)
+        return False
+    _remove_summary_tpl(vid)
+    invalidate_rows()
+    return True
+
+
+def stats() -> dict:
+    """总览页要的全库统计。
+
+    返回 {total, last7, with_tpl, translated, by_source, by_component}。
+    by_source 给环状图（平台分布），by_component 给横向条形图（组件 Top N）。
+    条形图只给前 20 名：组件名粒度不一，不截断的话一屏拉出去几百个长条，
+    看不出重点。剩下的并进"其他"。
+    """
+    rows = _load_rows()
+    by_source: dict[str, int] = {}
+    by_component: dict[str, int] = {}
+    for r in rows:
+        by_source[r["source"]] = by_source.get(r["source"], 0) + 1
+        by_component[r["component"]] = by_component.get(r["component"], 0) + 1
+
+    week = (datetime.now() - timedelta(days=7)).strftime("%Y-%m-%d")
+    comp_sorted = sorted(by_component.items(), key=lambda kv: -kv[1])
+    top = comp_sorted[:20]
+    rest = comp_sorted[20:]
+    if rest:
+        top.append(("其他（" + str(len(rest)) + " 项）", sum(n for _, n in rest)))
+    return {
+        "total": len(rows),
+        "last7": sum(1 for r in rows if (r["entry_iso"] or "") >= week),
+        "with_tpl": sum(1 for r in rows if r["has_nuclei"]),
+        "translated": sum(1 for r in rows if r["translated"]),
+        "by_source": by_source,
+        "by_component": top,
+    }
+

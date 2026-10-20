@@ -4,23 +4,25 @@
 
 简体中文 · [English](README.en.md)
 
-AI 赋能的漏洞播报系统，AI 根据公开的漏洞思路自动生成 PoC、漏洞简介、漏洞原理、攻击范围，自动落库存储，24 小时监控全网漏洞播报，间隔10分��[...] 
+AI 赋能的漏洞播报系统，AI 根据公开的漏洞思路自动生成 PoC、漏洞简介、漏洞原理、攻击范围，自动落库存储，24 小时监控全网漏洞播报，间隔10分钟自动抓取。
 
 ---
 
 #### 预览图
-
 ![界面预览](image.png)
 
 ## 特性
 
 - **多源聚合** — 并发抓取 Seebug、先知、Exploit-DB 的 RSS 与正文，单源失败不影响整体，每个请求有硬性超时。
+- **AI 内容判定** — 抓到的每一篇都先交给 LLM 判断性质：漏洞情报才收，赛事 WriteUp、工具教程、行业新闻一律不收。
 - **自助接入新社区** — 设置页填一个社区地址，系统自动探测其 feed 并由 AI 判断是否为漏洞社区，确认后落配置即抓。
 - **AI 补全** — LLM 将文章转为结构化情报：名称、简介、原理、攻击范围；文章已含 PoC 则原样收录，缺失则按公开思路补写 Python PoC。
 - **双向 nuclei 通道** — 收录的漏洞可导出为 nuclei v3 模板；上游模板库的新增模板也可增量同步入库。
 - **自动中文化** — 英文情报与模板元数据经 LLM 译为中文，CVE 编号、组件名、函数名保留原文。
+- **数据总览** — 组件数量横向条形图、平台分布多色环状图，一眼看清库里有什么。
+- **一键更新** — 设置页检测 GitHub 上有没有新版本，点一下快进到最新。
 - **文件式存储** — 无数据库依赖，每条漏洞一个目录，换库只改 `store.py`。
-- **内置 Web 控制台** — 漏洞列表、详情、模板库、在线设置，定时后台刷新并展示倒计时。
+- **内置 Web 控制台** — 漏洞列表、详情、总览、模板库、在线设置，定时后台刷新并展示倒计时。
 
 ## 技术栈
 
@@ -80,16 +82,20 @@ backend/
   sources.py      数据源聚合：文章源 + nuclei 模板源
   source_discovery.py  新社区接入：feed 地址探测 + AI 判活
   analyzer.py     AI 生成层：情报补全、PoC 生成、模板同步编排
+  content_judge.py  内容性质判定：让 LLM 分清漏洞情报与技术文章
   translate.py    情报中文化与批量回填
-  nuclei_tpl.py   PoC → nuclei 模板生成（结构化 JSON + YAML 组装)
+  nuclei_tpl.py   PoC → nuclei 模板生成（结构化 JSON + YAML 组装）
   nuclei_sync.py  nuclei-templates git 增量同步
   store.py        文件存储层
   llm.py          OpenAI 兼容客户端
-  data/           运行时数据（已忽略)
+  security.py     出站安全网关（SSRF 防护、XML 解析加固、限流）
+  updater.py      自更新：查 GitHub 新版本 + 快进合并
+  data/           运行时数据（已忽略）
 frontend/
   src/
     ListView.vue      漏洞列表
     DetailView.vue    漏洞详情
+    OverviewView.vue  数据总览（条形图 + 环状图）
     TemplatesView.vue 模板库
     SettingsView.vue  在线设置
 ```
@@ -97,13 +103,41 @@ frontend/
 ## 工作流程
 
 ```
-RSS 源 ──► crawler ──► analyzer ──► store ──► translate
-             │            │                      │
-             │            └──► nuclei_tpl ──► data/nuclei_tpl
+RSS 源 ──► crawler ──► content_judge ──► analyzer ──► store ──► translate
+             │              │                │                      │
+             │              │                └──► nuclei_tpl ──► data/nuclei_tpl
+             │              └──► 判为技术文章 → 直接丢弃
              └──► nuclei_sync ◄── nuclei-templates
 ```
 
-每轮任务开始时先同步上游模板库增量，再跑文章流水线，最后按 `keep_days` 清理过期条目。抓取与模板同步各自加锁，避免手动触发与定时任务撞��[...] 
+每轮任务开始时先同步上游模板库增量，再跑文章流水线，最后按 `keep_days` 清理过期条目。抓取与模板同步各自加锁，避免手动触发与定时任务撞车。
+
+## 内容判定：漏洞情报 vs 技术文章
+
+漏洞社区里混着大量"不是漏洞"的东西——赛事 WriteUp、CTF 解题报告、逆向教程、行业新闻、工具介绍。只按日期筛会把这些一起播出去。
+
+所以每一篇文章抓完正文后，都先交给 LLM 判一次性质（`content_judge.py`）：
+
+| 判定 | 含义 | 处理 |
+| --- | --- | --- |
+| `vuln` | 具体产品/组件的安全缺陷，含成因、影响版本、利用方式 | 收录 |
+| `writeup` | 比赛解题报告、赛后复现 | 丢弃 |
+| `tutorial` | 通用技术教程、科普 | 丢弃 |
+| `tool` | 工具、框架、扫描器介绍 | 丢弃 |
+| `news` | 行业资讯、观点评论、活动通知 | 丢弃 |
+| `other` / `unknown` | 说不清，或模型没给结论 | 丢弃 |
+
+几个原则：
+
+- **不用固定正则、关键词表**。写死的规则一定有漏网也有误杀，判别"这是不是漏洞"交给模型更靠谱。
+- **判不出来就不收**。模型不可用（超时、5xx）时本轮直接跳过，下一轮再抓，宁可漏收也不误收。
+- **模型给不出成稿也不收**。以前兜底模板会硬凑一条「（兜底）」的假情报进库，现在兜底条目直接丢弃。
+- **存量可复检**。设置页「复检存量内容」把库里已有的条目重新过一遍，不是漏洞的删掉，当初是兜底的重新生成。
+
+```bash
+# 复检全库（limit=0 表示不限条数）
+curl -X POST localhost:8100/api/vulns/recheck -d '{"limit": 0}'
+```
 
 ## nuclei 双向通道
 
@@ -127,7 +161,7 @@ curl -X POST localhost:8100/api/nuclei/pull -d '{"limit": 20}'      # 拉取入�
 
 ![接入新漏洞源](image2.png)
 
-设置页填一个社区首页即可，系统自动完成探测与判活：先按常见路径（`/feed`、`/rss`、`/rss.xml`、`/atom.xml` …）逐个试，解析得出条目的即为 feed；��[...] 
+设置页填一个社区首页即可，系统自动完成探测与判活：先按常见路径（`/feed`、`/rss`、`/rss.xml`、`/atom.xml` …）逐个试，解析得出条目的即为 feed；再把最新几条标题交给 AI 判断这是不是漏洞技术社区。确认后落入 `sources.custom`，下一轮抓取即生效，不必重启。
 
 ```bash
 # 探测（不写配置，先看结果）
@@ -161,9 +195,13 @@ curl -X DELETE localhost:8100/api/sources/先知
 | POST | `/api/vulns/{id}/translate` | 单条情报译为中文 |
 | POST | `/api/vulns/{id}/nuclei` | 生成 nuclei 模板 |
 | POST | `/api/vulns/purge` | 按 `keep_days` 清理过期条目 |
+| POST | `/api/vulns/recheck` | 存量内容复检：非漏洞条目删除、兜底条目重写 |
+| GET | `/api/stats` | 库内统计（总数 / 近 7 天 / 带模板 / 已中文化） |
 | POST | `/api/translate/backfill` | 批量翻译（`ids` 可指定范围） |
 | POST | `/api/collect` | 手动触发一轮抓取 |
 | GET | `/api/collect/status` | 抓取状态与下次执行时间 |
+| GET | `/api/update/check` | 检查 GitHub 上有没有新版本 |
+| POST | `/api/update/apply` | 拉取最新版本（只快进，本地有改动会拒绝） |
 | GET/POST | `/api/nuclei/sync` | 模板库同步状态 / 触发同步 |
 | GET | `/api/nuclei/templates` | 本地模板库列表 |
 | GET | `/api/nuclei/remote` | 预览上游模板库 |
@@ -182,7 +220,7 @@ backend/data/
 ├── vulns/{ID}/
 │   ├── meta.json       名称、来源、简介、原理、攻击范围、参考链接
 │   ├── poc.py          PoC 文本
-│   └── nuclei.yaml     对应模板（如有)
+│   └── nuclei.yaml     对应模板（如有）
 ├── nuclei_tpl/         全部模板汇总目录，可直接 nuclei -l 执行
 ├── nuclei_sync.json    模板库同步状态
 └── nuclei_cache/       远程模板库索引缓存

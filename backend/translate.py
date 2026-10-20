@@ -4,12 +4,21 @@ nuclei 模板库里的 name/summary 是英文，直接进播报列表不好读�
 译成中文；英文原文仍在 nuclei.yaml 里（模板全文原样落盘没动过），随时可对照。
 
 translated 标记写在 meta 上，回填时靠它跳过已译条目，避免重复烧 token。
+
+路径安全：漏洞 ID 来自接口参数，一律先过 security.require_vid，再经
+security.safe_join 拼出 meta.json 的完整路径，免得 "../../../etc/passwd"
+这种 ID 把文件读写引到漏洞库外面去。
 """
 import json
+import logging
+from pathlib import Path
 
 import config
+import security
 import store
 from llm import get_llm
+
+logger = logging.getLogger("ai_bobao.translate")
 
 _TRANSLATE_SYS = (
     "你是漏洞情报翻译，负责把英文漏洞信息译成简体中文，用于内部漏洞播报。只返回 JSON："
@@ -46,16 +55,37 @@ def translate_meta(meta: dict, llm=None) -> dict:
     return out
 
 
-def _write(f, meta: dict) -> None:
-    f.write_text(json.dumps(meta, ensure_ascii=False, indent=2), encoding="utf-8")
+def _write(f: Path, meta: dict) -> None:
+    """写回 meta.json。先写临时文件再原子替换，避免写到一半断电留下半个 JSON。"""
+    tmp = f.with_suffix(".json.tmp")
+    tmp.write_text(json.dumps(meta, ensure_ascii=False, indent=2), encoding="utf-8")
+    tmp.replace(f)
+
+
+def _meta_path(vid: str) -> Path:
+    """由漏洞 ID 算出 meta.json 的路径。ID 不合法就抛 SecurityError。"""
+    return security.safe_join(config.VULN_DIR, security.require_vid(vid), "meta.json")
 
 
 def translate_one(vid: str) -> dict:
-    """译单条并落盘。LLM 不可用直接返回原因，不写回。"""
-    f = config.VULN_DIR / vid / "meta.json"
+    """译单条并落盘。LLM 不可用直接返回原因，不写回。
+
+    vid 是接口参数，属于外部输入，先过 require_vid 白名单再拼路径。
+    """
+    try:
+        f = _meta_path(vid)
+    except security.SecurityError as e:
+        logger.warning("拒绝翻译：%s", e)
+        return {"ok": False, "reason": f"漏洞 ID 不合法：{e}"}
     if not f.is_file():
         return {"ok": False, "reason": "漏洞不存在"}
-    meta = json.loads(f.read_text(encoding="utf-8"))
+    try:
+        meta = json.loads(f.read_text(encoding="utf-8"))
+    except (OSError, ValueError) as e:
+        logger.warning("漏洞 %s 的 meta.json 读不出来：%s", vid, e)
+        return {"ok": False, "reason": "漏洞信息读取失败"}
+    if not isinstance(meta, dict):
+        return {"ok": False, "reason": "漏洞信息格式不对"}
     if not need_translate(meta):
         return {"ok": True, "skipped": True, "message": "已是中文"}
     try:
@@ -67,6 +97,7 @@ def translate_one(vid: str) -> dict:
     meta.update(zh)
     meta["translated"] = True
     _write(f, meta)
+    store.invalidate_rows()
     return {"ok": True, **zh}
 
 
@@ -80,10 +111,10 @@ def translate_and_fill(meta: dict, llm=None) -> dict:
     try:
         zh = translate_meta(meta, llm)
     except Exception as e:  # noqa: BLE001
-        print(f"[translate] LLM 不可用({e!r}) → 保留英文原名")
+        logger.warning("LLM 不可用（%r）→ 保留英文原名", e)
         return meta
     if not zh:
-        print(f"[translate] {meta.get('id')} 译文不完整 → 保留英文原名")
+        logger.warning("%s 译文不完整 → 保留英文原名", meta.get("id"))
         return meta
     meta.update(zh)
     meta["translated"] = True
@@ -97,20 +128,36 @@ def backfill(limit: int = 20, llm=None, ids: list[str] | None = None) -> dict:
     """
     llm = llm or get_llm()
     if ids is not None:
-        files = [config.VULN_DIR / vid / "meta.json" for vid in ids]
+        files = []
+        for vid in ids:
+            try:
+                files.append(_meta_path(vid))
+            except security.SecurityError as e:
+                logger.warning("批量翻译跳过非法 ID %r：%s", vid, e)
+                files.append(None)
     else:
         files = []
-        for f in config.VULN_DIR.glob("*/meta.json"):
+        for f in sorted(config.VULN_DIR.glob("*/meta.json")):
             if len(files) >= limit:
                 break
             files.append(f)
     ok, failed, skipped, done = [], [], 0, []
     for f in files:
+        if f is None:
+            failed.append({"id": "", "reason": "漏洞 ID 不合法"})
+            continue
         if not f.is_file():
             failed.append({"id": f.parent.name, "reason": "漏洞不存在"})
             continue
-        meta = json.loads(f.read_text(encoding="utf-8"))
-        vid = meta.get("id", f.parent.name)
+        try:
+            meta = json.loads(f.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            failed.append({"id": f.parent.name, "reason": "漏洞信息读取失败"})
+            continue
+        if not isinstance(meta, dict):
+            failed.append({"id": f.parent.name, "reason": "漏洞信息格式不对"})
+            continue
+        vid = str(meta.get("id") or f.parent.name)
         if not need_translate(meta):
             skipped += 1
             continue
@@ -127,5 +174,7 @@ def backfill(limit: int = 20, llm=None, ids: list[str] | None = None) -> dict:
         _write(f, meta)
         ok.append(vid)
         done.append(zh["name"])
+    if ok:
+        store.invalidate_rows()
     return {"ok": len(ok), "skipped": skipped, "failed": failed,
             "ids": ok, "names": done}

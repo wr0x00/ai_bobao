@@ -8,10 +8,14 @@ yaml 模板。原样入库，不过 LLM —— 模板本身就是最规范的探
 
 状态记在 data/nuclei_sync.json：{last_commit, last_sync, history}，
 所以进程重启、断网失败都不会重复入库。
+
+分支名（ref）会进 git 命令行，所以进函数先过 security.valid_ref：
+以 "-" 开头的名字会被 git 当成选项，"../" 能改目录，挡掉比事后排查省事。
 """
 from __future__ import annotations
 
 import json
+import logging
 import re
 import subprocess
 from dataclasses import dataclass
@@ -21,7 +25,10 @@ from pathlib import Path
 import yaml
 
 import nuclei_tpl
+import security
 from config import NUCLEI_REPO_DIR, NUCLEI_SYNC_STATE, TPL_REPO_URL
+
+logger = logging.getLogger("ai_bobao.nuclei_sync")
 
 # 仓库里这些目录不是可独立运行的模板，跳过
 _SKIP_DIRS = ("helpers/", "workflows/", ".github/", "tests/", "testdata/",
@@ -64,6 +71,11 @@ def _git(args: list[str], cwd: Path, timeout: int = _PULL_TIMEOUT) -> str:
     return r.stdout
 
 
+def run_git(args: list[str], cwd: Path, timeout: int = 120) -> str:
+    """对外的 git 入口。updater.py 更新自身版本时也用它，不用再自己找 git。"""
+    return _git(list(args), cwd, timeout=timeout)
+
+
 def _find_git() -> str | None:
     import shutil
     exe = shutil.which("git")
@@ -96,14 +108,20 @@ def _head_commit(repo: Path) -> str:
 
 
 def ensure_repo(ref: str) -> Path:
-    """确保模板仓库在本地且 ref 正确。首次克隆，浅克隆（--depth 1）省 90% 体积和时间。"""
+    """确保模板仓库在本地且 ref 正确。首次克隆，浅克隆（--depth 1）省 90% 体积和时间。
+
+    ref 会被拼进 git 命令，先校验形状：以 "-" 开头会被 git 当成选项，
+    带 "../" 能改目录，这两种直接拒掉。
+    """
+    if not security.valid_ref(ref):
+        raise ValueError(f"分支名不合法：{ref}")
     repo = NUCLEI_REPO_DIR
     if not (repo / ".git").is_dir():
         repo.parent.mkdir(parents=True, exist_ok=True)
         exe = _find_git()
         if not exe:
             raise RuntimeError("未找到 git，无法克隆 nuclei-templates")
-        print(f"[sync] 首次克隆 {TPL_REPO_URL} → {repo}（约 1.5w 文件，请稍候）")
+        logger.info("首次克隆 %s → %s（约 1.5w 文件，请稍候）", TPL_REPO_URL, repo)
         r = subprocess.run(
             [exe, "clone", "--depth", "1", "--branch", ref, TPL_REPO_URL, str(repo)],
             capture_output=True, timeout=_CLONE_TIMEOUT, encoding="utf-8", errors="replace")
@@ -117,7 +135,7 @@ def ensure_repo(ref: str) -> Path:
     # 本地有仓库，把 ref 切到配置的分支（用户改了 config.ref 时才动）
     cur = _git(["rev-parse", "--abbrev-ref", "HEAD"], repo, timeout=60).strip()
     if cur != ref:
-        print(f"[sync] 本地分支 {cur} → 切换到 {ref}")
+        logger.info("本地分支 %s → 切换到 %s", cur, ref)
         _git(["fetch", "--depth", "1", "origin", ref], repo, timeout=_PULL_TIMEOUT)
         _git(["checkout", "FETCH_HEAD"], repo, timeout=120)
     return repo
@@ -147,6 +165,8 @@ def pull(repo: Path, ref: str, old: str = "") -> str:
     上次同步点通常就还在本地，diff 直接可做。只有它真丢了（首次/远端 rebase）
     才由 changed_files() 回退全量。
     """
+    if not security.valid_ref(ref):
+        raise ValueError(f"分支名不合法：{ref}")
     if old:
         _tag(repo, old, SYNC_TAG)     # 钉住同步点，别被 shallow GC 掉
     _git(["fetch", "origin", ref], repo, timeout=_PULL_TIMEOUT)
@@ -313,10 +333,14 @@ def commit_state(commit: str, imported: int) -> None:
 
 
 def status() -> dict:
-    """同步状态，给前端展示用。"""
+    """同步状态，给前端展示用。
+
+    只回仓库目录名，不回绝对路径 —— 接口是公开的，绝对路径等于告诉别人
+    你的用户目录长什么样、装在哪儿。
+    """
     st = _state()
     repo = NUCLEI_REPO_DIR
-    return {"repo": str(repo), "cloned": (repo / ".git").is_dir(),
+    return {"repo": repo.name, "cloned": (repo / ".git").is_dir(),
             "last_commit": st.get("last_commit", ""),
             "last_commit_short": (st.get("last_commit") or "")[:12],
             "last_sync": st.get("last_sync", ""),

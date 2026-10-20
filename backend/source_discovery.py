@@ -12,11 +12,17 @@
 
 平台型 API（OSV / GitHub Advisory 这类 JSON 接口）暂未实现，
 扩展点见文件末尾 _API_ADAPTERS。
+
+出站安全：首页地址是用户填的，属于不可信输入。探测前先过 security.check_url，
+把内网地址、回环地址、云元数据地址挡在门外；实际请求再由安全网关兜一层。
 """
+import logging
 import re
-import xml.etree.ElementTree as ET
 
 import llm
+import security
+
+logger = logging.getLogger("ai_bobao.source_discovery")
 
 # 按命中率的常见 feed 路径。带 .xml 的放前面：同一站点常有多个别名，
 # 猜错也只是多试一次，顺序无所谓，但先试更规范的名字。
@@ -34,8 +40,8 @@ def _get(url: str, timeout: float = 12) -> bytes:
 def _count_entries(raw: bytes) -> tuple[int, list[str]]:
     """能解析成 feed 就返回 (条目数, 前几条标题)，不是 feed 返回 (0, [])。"""
     try:
-        root = ET.fromstring(raw)
-    except ET.ParseError:
+        root = security.parse_xml(raw)
+    except Exception:  # noqa: BLE001 —— 不是 XML、DTD 实体、格式错，都当"不是 feed"
         return 0, []
     items = list(root.iter("item")) + list(root.iter(f"{_ATOM}entry"))
     titles = []
@@ -45,16 +51,28 @@ def _count_entries(raw: bytes) -> tuple[int, list[str]]:
     return len(items), titles
 
 
-def _candidates(url: str) -> list[str]:
-    """待探测的 URL 列表：用户给的可能就是 feed，也可能只是首页。"""
+def _normalize(url: str) -> str:
+    """用户可能只填了域名，补上 https:// 再往下走。"""
     base = url.strip().rstrip("/")
     if not base.startswith(("http://", "https://")):
         base = "https://" + base
+    return base
+
+
+def _candidates(url: str) -> list[str]:
+    """待探测的 URL 列表：用户给的可能就是 feed，也可能只是首页。"""
+    base = _normalize(url)
     return [base] + [base + s for s in _SUFFIXES]
 
 
 def probe(url: str) -> list[dict]:
-    """挨个试候选 URL，返回所有能解析出条目的地址。"""
+    """挨个试候选 URL，返回所有能解析出条目的地址。
+
+    探测前先把用户给的地址校验一遍：只允许 http/https，域名解析出来的
+    IP 不能是内网/回环/云元数据地址。挡不住的地址直接抛 SecurityError，
+    上层转成 400 返回给前端。
+    """
+    security.check_url(_normalize(url))
     found = []
     for cand in _candidates(url):
         try:

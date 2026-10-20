@@ -1,8 +1,8 @@
 <template>
-  <div v-if="error" class="error">加载失败：{{ error }} <a href="#" @click.prevent="$router.push('/')">返回列表</a></div>
+  <div v-if="error" class="error">加载失败：{{ error }} <a href="#" @click.prevent="back">返回列表</a></div>
   <div v-else-if="!v" class="empty">加载中…</div>
   <div v-else>
-    <a href="#" @click.prevent="$router.push('/')">← 返回列表</a>
+    <a href="#" @click.prevent="back">← 返回列表</a>
     <div class="titlerow">
       <h2 class="title">{{ v.name }}</h2>
       <button v-if="needZh" class="gen zh" :disabled="!!busy" @click="doTranslate"
@@ -55,11 +55,13 @@
       <p v-else class="none">{{ genMsg || '暂无模板。' }}</p>
     </section>
 
-    <section v-if="v.refs && v.refs.length">
+    <section v-if="refLinks.length">
       <h3>原文 / 参考链接</h3>
       <ul class="refs">
-        <li v-for="r in v.refs" :key="r">
-          <a :href="r" target="_blank" rel="noopener noreferrer">{{ r }}</a>
+        <li v-for="r in refLinks" :key="r.text">
+          <!-- href 过不了白名单就只显示文字，宁可点不了也不能让 javascript: 执行 -->
+          <a v-if="r.href" :href="r.href" target="_blank" rel="noopener noreferrer">{{ r.text }}</a>
+          <span v-else>{{ r.text }}</span>
         </li>
       </ul>
     </section>
@@ -67,11 +69,18 @@
 </template>
 
 <script setup>
-import { onMounted, ref, watch } from 'vue'
-import { useRoute } from 'vue-router'
+// DetailView.vue —— 漏洞详情
+//
+// 展示一条漏洞的全貌，并挂上三个 AI 加工按钮：译成中文、生成 PoC、生成 nuclei 模板。
+// 三者都会改数据，走的都是带令牌的 POST。
+
+import { computed, onMounted, ref, watch } from 'vue'
+import { useRoute, useRouter } from 'vue-router'
 import { genNuclei, genPoc, getVuln, llmStatus, translateVuln } from './api'
+import { safePath, safeUrl } from './safe'
 
 const route = useRoute()
+const router = useRouter()
 const v = ref(null)
 const error = ref('')
 const copied = ref('')
@@ -89,6 +98,29 @@ const needZh = ref(false)
 // 名称里没有中文字符 = 大概率是 nuclei 英文模板，可以翻译
 const hasZh = (s) => /[一-鿿]/.test(s || '')
 
+// 参考链接要直接进 href，所以每个都过一遍协议白名单。
+// safeUrl 返回空串的（比如 javascript:）就只当纯文本显示，不给可点的入口。
+const refLinks = computed(() =>
+  (v.value?.refs || []).map((text) => ({ text, href: safeUrl(text) })),
+)
+
+// 返回列表时回到原来的筛选结果页（搜索词、来源页签、页码都还在）。
+// from 来自 URL，必须校验：只接受站内绝对路径，挡掉 //evil.com 这种开放重定向。
+const backPath = computed(() => safePath(route.query.from) || '/')
+
+// 优先用浏览器后退，这样详情页不会在历史栈里堆出一串重复的列表页；
+// 但直接粘贴 URL 打开详情时没有来路，只能 push 补上。
+function back() {
+  const prev = String(window.history.state?.back || '')
+  if (prev && prev === backPath.value) router.back()
+  else router.push(backPath.value)
+}
+
+/**
+ * 拉一条漏洞的详情。
+ *
+ * @param {string} id 漏洞 ID
+ */
 async function load(id) {
   v.value = null
   error.value = ''
@@ -103,12 +135,18 @@ async function load(id) {
   }
 }
 
+/**
+ * 复制一段代码到剪贴板，顺便闪一下「已复制」。
+ *
+ * @param {'poc'|'nuclei'} which 要复制哪一段
+ */
 async function copy(which) {
   await navigator.clipboard.writeText(v.value[which === 'poc' ? 'poc' : 'nuclei_yaml'] || '')
   copied.value = which
   setTimeout(() => (copied.value = ''), 1500)
 }
 
+/** 让 AI 按公开思路生成一个 Python PoC，写回这条漏洞。 */
 async function doGenPoc() {
   busy.value = 'poc'
   pocMsg.value = ''
@@ -124,6 +162,7 @@ async function doGenPoc() {
   }
 }
 
+/** 把这条漏洞的标题、简介、原理译成中文。 */
 async function doTranslate() {
   busy.value = 'zh'
   genMsg.value = ''
@@ -137,6 +176,7 @@ async function doTranslate() {
   }
 }
 
+/** 让 AI 生成 nuclei 模板，生成完自动重载详情。 */
 async function gen() {
   genning.value = true
   genMsg.value = ''

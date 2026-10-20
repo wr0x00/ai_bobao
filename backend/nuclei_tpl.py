@@ -21,24 +21,34 @@ from __future__ import annotations
 import base64
 import hashlib
 import json
+import logging
 import os
 import re
-import ssl
 import threading
 import time
-import urllib.error
-import urllib.request
 from dataclasses import dataclass, field
 from pathlib import Path
 
 import yaml
 
-_SSL_CTX = ssl._create_unverified_context()
+import security
+
+logger = logging.getLogger("ai_bobao.nuclei_tpl")
+
 _UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) Chrome/130.0.0.0"
 
 SEVERITIES = ["info", "low", "medium", "high", "critical"]
 _CVSS_BANDS = [(9.0, "critical"), (7.0, "high"), (4.0, "medium"), (0.1, "low"), (0.0, "info")]
 _INDEX_TTL = 6 * 3600          # 远程索引缓存时长（秒）
+MAX_TREE = 32 * 1024 * 1024    # GitHub 文件树响应上限 32MB
+MAX_TPL = 2 * 1024 * 1024      # 单个模板响应上限 2MB
+
+# 仓库名与分支名的白名单放在 security.py（config.py、nuclei_sync.py 也要用），
+# 这里直接转出去，省得三处各写一份、日后改形状时漏掉一处。
+REPO_RE = security.REPO_RE
+REF_RE = security.REF_RE
+valid_repo = security.valid_repo
+valid_ref = security.valid_ref
 
 # 写操作路径特征 —— 命中就要求显式 allow_write
 _WRITE_HINT = re.compile(
@@ -105,24 +115,29 @@ def _with_deadline(fn, timeout: float = 30.0, retry: int = 0):
             return box["data"]
         if attempt >= retry:
             raise err
-        print(f"[nuclei] {err!r}，{attempt + 1}/{retry} 次重试")
+        logger.warning("%r，%d/%d 次重试", err, attempt + 1, retry)
     raise RuntimeError("unreachable")
 
 
-def _http_get(url: str, timeout: float = 20.0, raw: bool = True):
-    req = urllib.request.Request(url, headers={"User-Agent": _UA, "Accept": "*/*"})
-    with urllib.request.urlopen(req, timeout=timeout, context=_SSL_CTX) as r:
-        return r.read() if raw else r.read().decode("utf-8", "replace")
+def _http_get(url: str, timeout: float = 20.0, raw: bool = True, max_bytes: int = MAX_TPL):
+    """取一个 URL 的内容。走安全网关，内网地址和超大响应都拿不到。"""
+    body = security.open_url(
+        url,
+        timeout=timeout,
+        max_bytes=max_bytes,
+        headers={"User-Agent": _UA, "Accept": "*/*"},
+    )
+    return body if raw else body.decode("utf-8", "replace")
 
 
-def _http_json(url: str, timeout: float = 20.0) -> dict:
+def _http_json(url: str, timeout: float = 20.0, max_bytes: int = MAX_TREE) -> dict:
+    """取一个 JSON 接口。GitHub Token 存在环境变量里，设了就带上，能省不少限流配额。"""
     token = os.getenv("GITHUB_TOKEN", "")
     headers = {"User-Agent": _UA, "Accept": "application/vnd.github+json"}
     if token:
         headers["Authorization"] = f"Bearer {token}"
-    req = urllib.request.Request(url, headers=headers)
-    with urllib.request.urlopen(req, timeout=timeout, context=_SSL_CTX) as r:
-        return json.loads(r.read())
+    raw = security.open_url(url, timeout=timeout, max_bytes=max_bytes, headers=headers)
+    return json.loads(raw)
 
 
 def _slug(text: str, fallback: str = "ai-bobao-vuln") -> str:
@@ -239,11 +254,18 @@ def fetch_remote_index(repo: str, ref: str = "main", timeout: float = 120.0) -> 
     nuclei-templates 有 1.5 万个节点，未认证时这接口要 80s+，所以默认超时给足；
     设 GITHUB_TOKEN 环境变量可显著提速。结果会被 fetch_remote_templates 缓存 6 小时。
     响应有 2MB+，网关偶发中途截断，重死线放在每次尝试内部（整体再包一层就误杀重试了）。
+
+    repo 和 ref 会被拼进 GitHub 的 URL，形状不合法直接拒 —— config.yaml
+    可能被人手改过，光靠设置页的校验不够。
     """
+    if not valid_repo(repo):
+        raise ValueError(f"仓库名不合法：{repo}")
+    if not valid_ref(ref):
+        raise ValueError(f"分支名不合法：{ref}")
     url = f"https://api.github.com/repos/{repo}/git/trees/{ref}?recursive=1"
     data = _with_deadline(lambda: _http_json(url, timeout), timeout + 30, retry=2)
     if data.get("truncated"):
-        print("[nuclei] 文件树被 GitHub 截断，结果不完整")
+        logger.warning("文件树被 GitHub 截断，结果不完整")
     paths = []
     for node in data.get("tree", []):
         p = node.get("path", "")
@@ -310,7 +332,14 @@ def fetch_remote_templates(repo: str, ref: str = "main", limit: int = 30,
 
     severity 只能下完模板按 info.severity 精确筛（仓库目录不按严重性分），
     所以按 severity 拉时候选池放大到 limit*5。
+
+    repo 和 ref 会被拼进 GitHub 的 URL，形状不合法直接拒 —— config.yaml
+    可能被人手改过，光靠设置页的校验不够。
     """
+    if not valid_repo(repo):
+        raise ValueError(f"仓库名不合法：{repo}")
+    if not valid_ref(ref):
+        raise ValueError(f"分支名不合法：{ref}")
     idx_f = (cache_dir / "_index.json") if cache_dir else None
     paths: list[str] = []
     if idx_f and idx_f.is_file():
@@ -340,7 +369,7 @@ def fetch_remote_templates(repo: str, ref: str = "main", limit: int = 30,
         try:
             doc = fetch_remote_template(repo, p, ref, cache_dir)
         except Exception as e:  # noqa: BLE001
-            print(f"[nuclei] 拉取失败 {p}: {e!r}")
+            logger.warning("拉取失败 %s：%r", p, e)
             continue
         tpl = parse_template(doc, p) if doc else None
         if tpl and (not severity or tpl.severity == severity.lower()):
@@ -509,8 +538,9 @@ def _clean_spec(spec: dict, meta: dict) -> dict:
         if req.get("body") and isinstance(req["body"], (str, dict)):
             body = req["body"]
             item["body"] = json.dumps(body, ensure_ascii=False) if isinstance(body, dict) else str(body)[:2000]
-        if method != "GET":
-            item["attack"] = "none"
+        # 标上 attack: none，告诉 nuclei 这是只读探测模板，不会真的去改目标。
+        # 不标的话 nuclei 会按普通攻击模板跑，GET 探测也会被当成要执行的漏洞利用。
+        item["attack"] = "none"
         http.append(item)
     return {"id": _slug(spec.get("id") or meta.get("id", "")),
             "name": str(spec.get("name") or meta.get("name") or meta.get("id", ""))[:120],
@@ -585,9 +615,9 @@ def vuln_to_spec(meta: dict, poc: str, llm=None) -> tuple[dict, str]:
         spec = _clean_spec(r if isinstance(r, dict) else {}, meta)
         if spec["http"]:
             return spec, "llm"
-        print("[nuclei] LLM spec 无有效 http 段 → 启发式兜底")
+        logger.info("LLM spec 无有效 http 段 → 启发式兜底")
     except Exception as e:  # noqa: BLE001
-        print(f"[nuclei] LLM 不可用({e!r}) → 启发式兜底")
+        logger.warning("LLM 不可用（%r）→ 启发式兜底", e)
     return heuristic, "heuristic"
 
 

@@ -1,6 +1,58 @@
 // api.js —— 后端接口封装
-async function req(url, options) {
-    const r = await fetch(url, options)
+//
+// 后端把每个 /api 都收紧了：必须带 X-AI-BaoBao 标志头，写操作还得再带一个令牌。
+// 这套头和令牌都在这里统一拼，不让各个页面各写一遍——漏一处就是一个 403。
+
+// 写操作令牌。第一次 POST / DELETE 时才去要，拿到就一直留在内存里。
+let token = ''
+    // 正在取令牌的 Promise。并发请求时复用同一个，别一串请求打出去好几个 /api/session。
+let tokenTask = null
+
+/** 拉一次写操作令牌。已经有或在拉了就直接用现成的。 */
+async function ensureToken() {
+    if (token) return token
+    if (!tokenTask) {
+        // 走统一的 req 而不是裸 fetch：后端要求每个 /api 请求都带 X-AI-BaoBao 头，
+        // 漏了这个头 /api/session 会直接 403，令牌就永远拿不到。
+        tokenTask = req('/api/session')
+            .then((data) => {
+                token = (data && data.token) || ''
+                tokenTask = null
+                return token
+            })
+            .catch(() => {
+                tokenTask = null
+                return ''
+            })
+    }
+    return tokenTask
+}
+
+/**
+ * 发一个请求，把后端的失败原因原样抛出去。
+ *
+ * @param {string} url 请求地址
+ * @param {object} [options] fetch 的选项，会在这里补上安全相关的头
+ * @returns {Promise<object>} 后端返回的 JSON
+ */
+async function req(url, options = {}) {
+    const method = (options.method || 'GET').toUpperCase()
+    const headers = { 'X-AI-BaoBao': '1', ...(options.headers || {}) }
+
+    // 只有改数据的动作要令牌，读接口不用，省一次往返。
+    if (method !== 'GET' && method !== 'HEAD') {
+        const t = await ensureToken()
+        if (t) headers['X-AI-BaoBao-Token'] = t
+    }
+
+    const r = await fetch(url, {
+        credentials: 'same-origin',
+        cache: 'no-store',
+        ...options,
+        method,
+        headers,
+    })
+
     if (!r.ok) {
         // FastAPI 把原因放在 detail 里，取出来比干巴巴的 HTTP 400 好用
         let detail = ''
@@ -16,19 +68,29 @@ async function req(url, options) {
     return r.json()
 }
 
+/**
+ * 发一个写请求。body 会被序列化成 JSON。
+ *
+ * @param {string} url 请求地址
+ * @param {object} [body] 请求体
+ * @returns {Promise<object>} 后端返回的 JSON
+ */
 const post = (url, body) => req(url, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify(body || {}),
 })
 
-export const listVulns = (q = {}) => {
-    const p = new URLSearchParams(Object.entries(q).filter(([, v]) => v !== '' && v != null))
-    return req(`/api/vulns?${p}`)
-}
+/** 把查询参数对象拼成 query string，空值和 null 直接丢掉。 */
+const query = (q = {}) =>
+    new URLSearchParams(Object.entries(q).filter(([, v]) => v !== '' && v != null)).toString()
+
+// ── 漏洞列表与详情 ────────────────────────────────────────
+export const listVulns = (q = {}) => req(`/api/vulns?${query(q)}`)
 
 export const getVuln = (id) => req(`/api/vulns/${encodeURIComponent(id)}`)
 
+// ── 采集 ──────────────────────────────────────────────────
 export const runCollect = () => post('/api/collect')
 
 export const collectStatus = () => req('/api/collect/status')
@@ -41,10 +103,7 @@ export const syncStatus = () => req('/api/nuclei/sync')
 
 export const runSync = (body = {}) => post('/api/nuclei/sync', body)
 
-export const previewRemote = (q = {}) => {
-    const p = new URLSearchParams(Object.entries(q).filter(([, v]) => v !== '' && v != null))
-    return req(`/api/nuclei/remote?${p}`)
-}
+export const previewRemote = (q = {}) => req(`/api/nuclei/remote?${query(q)}`)
 
 export const pullRemote = (body) => post('/api/nuclei/pull', body)
 
@@ -64,6 +123,13 @@ export const llmStatus = () => req('/api/llm/status')
 
 export const purgeExpired = () => post('/api/vulns/purge')
 
+// 存量复检：模型重判每条的内容性质，删掉赛事 WriteUp、重写「（兜底）」条目。
+// limit 传 0 = 全库；后端一次最多接 2000 条，逐条调模型，会跑一会儿。
+export const recheckLibrary = (limit = 0) => post('/api/vulns/recheck', { limit })
+
+// ── 总览 ────────────────────────────────────────────────
+export const getStats = () => req('/api/stats')
+
 // ── 设置 ────────────────────────────────────────────────
 export const getSettings = () => req('/api/settings')
 
@@ -82,3 +148,10 @@ export const addSource = (s) => post('/api/sources', s)
 
 export const delSource = (name) =>
     req(`/api/sources/${encodeURIComponent(name)}`, { method: 'DELETE' })
+
+// ── 自更新 ──────────────────────────────────────────────
+// 检测更新只读：比对本地 HEAD 和 GitHub 远端分支头
+export const checkUpdate = () => req('/api/update/check')
+
+// 拉取最新版本：后端只做 --ff-only 快进，本地有未提交改动会拒绝
+export const applyUpdate = () => post('/api/update/apply')

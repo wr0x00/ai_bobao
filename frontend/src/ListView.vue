@@ -13,6 +13,13 @@
       </div>
     </div>
 
+    <div class="searchbar">
+      <input v-model="kw" type="search" placeholder="搜索标题、CVE 编号、漏洞原理…（空格分隔多个关键词）"
+             @keyup.enter="search" />
+      <button class="ghost" :disabled="!kw" @click="kw = ''; search()">清空</button>
+      <span v-if="kw" class="hit">命中 {{ total }} 条</span>
+    </div>
+
     <div class="tabs">
       <button v-for="s in sources" :key="s.name" class="tab"
               :class="{ active: cur === s.name }" @click="pick(s.name)">
@@ -21,9 +28,9 @@
     </div>
 
     <div v-if="error" class="error">加载失败：{{ error }}</div>
-    <div v-else-if="!items.length" class="empty">该栏目暂无漏洞。</div>
+    <div v-else-if="!items.length" class="empty">{{ kw ? `没有匹配「${kw}」的漏洞。` : '该栏目暂无漏洞。' }}</div>
 
-    <div v-for="v in items" :key="v.id" class="card" @click="$router.push(`/vuln/${v.id}`)">
+    <div v-for="v in items" :key="v.id" class="card" @click="openVuln(v.id)">
       <div class="row">
         <span class="name">{{ v.name }}</span>
         <span v-if="!v.translated" class="needzh" title="标题/简介还是英文">EN</span>
@@ -44,20 +51,32 @@
 </template>
 
 <script setup>
-import { computed, onBeforeUnmount, onMounted, ref } from 'vue'
+// ListView.vue —— 漏洞列表（首页）
+//
+// 这一页只干一件事：把筛选状态和地址栏 query 保持同步。
+// 搜索词、来源页签、页码三样都写在 URL 上，所以刷新、进详情再返回、
+// 浏览器前进后退，结果都能一模一样地还原。
+
+import { computed, onBeforeUnmount, onMounted, ref, watch } from 'vue'
+import { useRoute, useRouter } from 'vue-router'
 import { backfillTranslate, collectStatus, listVulns, llmStatus, runCollect } from './api'
 
 const PAGE_SIZE = 10          // 一页 10 条
+
+const route = useRoute()
+const router = useRouter()
 
 const items = ref([])
 const counts = ref({})
 const allTotal = ref(0)
 const total = ref(0)
-const page = ref(1)
+// 初始值从 URL 里取：刷新页面后搜索词、页签、页码都还在
+const page = ref(Math.max(1, parseInt(route.query.page, 10) || 1))
 const pages = ref(1)
 const error = ref('')
 const collecting = ref(false)
-const cur = ref('全部')
+const cur = ref(String(route.query.source || '全部'))
+const kw = ref(String(route.query.q || ''))   // 搜索框内容，回车/清空时才真正拿去查
 const st = ref(null)
 const llmOk = ref(true)         // LLM 不可用时置灰 AI 按钮
 const translating = ref(false)
@@ -95,11 +114,16 @@ const statusText = computed(() => {
   return `共 ${allTotal.value} 个已收录漏洞 · ${last} · 每 ${st.value.interval_minutes} 分钟自动更新${nxt}`
 })
 
+/**
+ * 按当前筛选条件重新拉一页数据。
+ * 后端返回的页码是权威的（越界时它会自己纠正），所以拿它覆盖本地的 page。
+ */
 async function load() {
   try {
     const r = await listVulns({
       page: page.value, page_size: PAGE_SIZE,
       source: cur.value === '全部' ? '' : cur.value,
+      q: kw.value.trim(),
     })
     items.value = r.items
     counts.value = r.counts || {}
@@ -107,9 +131,43 @@ async function load() {
     total.value = r.total
     pages.value = r.pages
     page.value = r.page
+    syncUrl()
   } catch (e) {
     error.value = e.message
   }
+}
+
+// 把当前筛选状态写回地址栏。刷新页面、切详情再返回，都靠这串 query 还原现场。
+// 用 replace 而不是 push，免得用户每搜一次就多一条历史记录，按返回键要按好几下。
+
+/**
+ * 摊出当前筛选条件对应的 query 对象。
+ *
+ * @returns {{q?: string, source?: string, page?: string}} 只含需要保留的字段，默认值不带
+ */
+function currentQuery() {
+  const q = {}
+  if (kw.value.trim()) q.q = kw.value.trim()
+  if (cur.value !== '全部') q.source = cur.value
+  if (page.value > 1) q.page = String(page.value)
+  return q
+}
+
+/** 把筛选状态同步到地址栏。 */
+function syncUrl() {
+  router.replace({ path: '/', query: currentQuery() })
+}
+
+// 进详情页时把当前列表地址带上，详情页的「返回列表」就能原路退回，
+// 而不是把用户丢回全量首页。
+/**
+ * 打开漏洞详情。
+ *
+ * @param {string} id 漏洞 ID
+ */
+function openVuln(id) {
+  const from = router.resolve({ path: '/', query: currentQuery() }).fullPath
+  router.push({ path: `/vuln/${id}`, query: { from } })
 }
 
 // 拉状态不阻塞列表渲染：LLM 状态接口慢，不能让它把列表卡住
@@ -123,17 +181,34 @@ async function loadStatus() {
   }
 }
 
+/**
+ * 翻页。顺手把越界的页码夹回有效范围。
+ *
+ * @param {number} p 目标页码
+ */
 function go(p) {
   page.value = Math.max(1, Math.min(p, pages.value))
   load()
 }
 
+/**
+ * 切来源页签。换了来源就回到第一页，不然可能停在新来源里不存在的那一页。
+ *
+ * @param {string} name 来源名，「全部」也是一个正常的值
+ */
 function pick(name) {
   cur.value = name
   page.value = 1
   load()
 }
 
+/** 按当前搜索词重新查一遍。换关键词后必须回第一页，否则停在新关键词的第 5 页上会是空列表。 */
+function search() {
+  page.value = 1
+  load()
+}
+
+/** 把本页所有英文漏洞交给后端批量翻译。 */
 async function translatePage() {
   translating.value = true
   done.value = 0
@@ -151,6 +226,7 @@ async function translatePage() {
   }
 }
 
+/** 手动触发一次抓取。跑完自动刷新列表。 */
 async function collect() {
   collecting.value = true
   try {
@@ -169,6 +245,19 @@ onMounted(() => {
   timer = setInterval(() => (now.value = Date.now()), 1000)
 })
 
+// 地址栏里的 query 变了（浏览器前进/后退、或用户手改地址）就照着重新拉一次。
+// syncUrl 写回的是同一份状态，比较相同就不动，避免自己触发自己死循环。
+watch(() => route.query, (q) => {
+  const nq = String(q.q || '')
+  const nsrc = String(q.source || '全部')
+  const np = Math.max(1, parseInt(q.page, 10) || 1)
+  if (nq === kw.value.trim() && nsrc === cur.value && np === page.value) return
+  kw.value = nq
+  cur.value = nsrc
+  page.value = np
+  load()
+})
+
 // 离开页面后 ticker 还在跑的话，既白耗 CPU 又在往已卸载组件上写 ref
 onBeforeUnmount(() => clearInterval(timer))
 </script>
@@ -181,6 +270,16 @@ button.ghost { background: #171a21; color: #9ca3af; border: 1px solid #262b36; }
 button:disabled { background: #374151; cursor: not-allowed; }
 .error { color: #f87171; margin: 12px 0; }
 .empty { color: #8b93a1; padding: 40px 0; text-align: center; }
+
+.searchbar { display: flex; align-items: center; gap: 10px; margin-bottom: 14px; }
+/* 搜索框不要撑满整行：flex:1 会让它拉成 860px，一条短关键词看着像输入栏坏了。
+   给个 320px 的上限，窄屏再 flex-shrink 缩下去。 */
+.searchbar input { flex: 0 1 320px; min-width: 160px; background: #171a21; color: #e6e6e6;
+  border: 1px solid #262b36; border-radius: 6px; padding: 8px 12px; font-size: 13px; outline: none; }
+.searchbar input:focus { border-color: #3b82f6; }
+.searchbar input::placeholder { color: #6b7280; }
+.searchbar button { padding: 8px 14px; font-size: 13px; }
+.hit { color: #8b93a1; font-size: 13px; white-space: nowrap; }
 
 .tabs { display: flex; flex-wrap: wrap; gap: 8px; margin-bottom: 16px; }
 .tab { background: #171a21; color: #9ca3af; border: 1px solid #262b36; border-radius: 999px;

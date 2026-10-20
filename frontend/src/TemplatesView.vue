@@ -64,6 +64,11 @@
 </template>
 
 <script setup>
+// TemplatesView.vue —— nuclei 模板库
+//
+// 两个视图共用一块列表：本地模板库（git clone 下来的那份）和远程模板库（GitHub 上的仓库）。
+// 远程视图只做预览，真正入库要点「拉取入库」。
+
 import { computed, onMounted, ref } from 'vue'
 import { useRouter } from 'vue-router'
 import { listTemplates, previewRemote, pullRemote, runSync, syncStatus } from './api'
@@ -86,6 +91,7 @@ const sync = ref({ cloned: false, local_templates: 0, last_imported: 0 })
 
 const rows = computed(() => (mode.value === 'local' ? local.value : remote.value))
 
+/** 刷新顶部的同步状态条。取不到就保持原样，这是辅助信息，不该打断主流程。 */
 async function loadSync() {
   try {
     sync.value = await syncStatus()
@@ -94,6 +100,11 @@ async function loadSync() {
   }
 }
 
+/**
+ * 跑一次模板库同步。
+ *
+ * @param {object} body 传给后端的参数，{ full: true } 表示忽略上次进度重扫全量
+ */
 async function doSync(body) {
   busy.value = true
   syncing.value = true
@@ -119,6 +130,7 @@ async function doSync(body) {
   }
 }
 
+/** 拉本地模板列表和模板目录路径。 */
 async function loadLocal() {
   error.value = ''
   try {
@@ -130,12 +142,18 @@ async function loadLocal() {
   }
 }
 
+/**
+ * 切换本地 / 远程视图。顺带清掉上一次的提示文字。
+ *
+ * @param {'local'|'remote'} m 目标视图
+ */
 function switchMode(m) {
   mode.value = m
   msg.value = ''
   error.value = ''
 }
 
+/** 从远程模板库取一批样例出来看看，不入库。 */
 async function preview() {
   busy.value = true
   error.value = ''
@@ -151,6 +169,7 @@ async function preview() {
   }
 }
 
+/** 从远程模板库拉一批模板入库。 */
 async function pull() {
   busy.value = true
   error.value = ''
@@ -168,6 +187,12 @@ async function pull() {
 }
 
 // 本地条目文件名即漏洞 id，可直接回详情页；远程条目还没入库，点不动
+
+/**
+ * 点开一条模板。本地条目才点得动。
+ *
+ * @param {object} t 模板条目
+ */
 function open(t) {
   if (mode.value === 'local' && t.vid) router.push(`/vuln/${t.vid}`)
 }

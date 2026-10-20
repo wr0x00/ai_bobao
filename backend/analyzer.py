@@ -1,7 +1,8 @@
 """analyzer.py —— AI 生成层（流水线：爬文章 → 提 PoC → AI 按公开思路生成 → 落文件库）
 
-AI 只干两件事：抓全网漏洞、按公开思路生成 PoC。**不做"漏洞是否可用"的判断** ——
-那是人（或授权测试）看到播报之后的事，模型自己拍板只会把新漏洞误杀在门外。
+AI 干三件事：抓全网漏洞、给漏洞写 PoC、**分清抓到的东西是不是漏洞情报**。
+最后这项以前没有，于是《XX 大赛 WriteUp》这种技术文章也被当成漏洞播了出去；
+现在交给 content_judge 用模型判，判不出就不收。
 
 PoC 来源两条路（字段 poc_source）：
 - article：文章里已含 PoC 代码块，爬虫提取原样入库
@@ -14,9 +15,11 @@ nuclei 通道：
 - 模板库增量同步（sync_templates）独立成入口，模板原样入库不过 LLM
 """
 import json
+import logging
 from datetime import datetime
 
 import config
+import content_judge
 import crawler
 import nuclei_sync
 import nuclei_tpl
@@ -24,6 +27,8 @@ import store
 import translate
 from llm import LLM, get_llm
 from sources import fetch_all, fetch_nuclei_remote
+
+logger = logging.getLogger("ai_bobao.analyzer")
 
 _GENERATE_SYS = (
     "你是资深安全研究员，为漏洞播报系统生成结构化情报，内容仅用于防御研究与"
@@ -52,7 +57,7 @@ def llm_generate(llm: LLM, item: dict, content: str = "", poc: str | None = None
         if r.get("name") and r.get("poc"):
             return r
     except Exception as e:  # noqa: BLE001
-        print(f"[generate] LLM 不可用({e!r}) → 模板兜底")
+        logger.warning("LLM 不可用（%r），改用兜底模板", e)
     fallback_poc = poc or (
         f"# {item['id']} 概念验证模板（兜底生成，仅用于授权测试）\n"
         "import requests\n\nTARGET = \"http://TARGET\"\n\n"
@@ -66,7 +71,10 @@ def llm_generate(llm: LLM, item: dict, content: str = "", poc: str | None = None
             "summary": item.get("summary", "")[:120],
             "principle": "成因与利用思路见原文，建议阅读参考链接确认影响版本。",
             "attack_scope": "以原文描述的影响范围为准（模板兜底生成）。",
-            "poc_lang": "python", "poc": fallback_poc}
+            "poc_lang": "python", "poc": fallback_poc,
+            # 标记出来：模型没给出成稿的条目不该入库，否则列表里会挂着一堆
+            # 「XXX（兜底）」，既不是可信情报，也不是像样的情报
+            "fallback": True}
 
 
 _POC_SYS = (
@@ -169,8 +177,8 @@ def sync_templates(full: bool = False, limit: int = 0) -> dict:
                 zh_fail += 1
         saved.append(store.save(meta, poc, "python", yaml_text))
     nuclei_sync.commit_state(r.to_commit, len(saved))
-    print(f"[sync] 入库 {len(saved)} 条（译文 {zh_ok} / 保留英文 {zh_fail}），"
-          f"已存在 {skipped}，过期丢弃 {expired}，解析失败 {failed}")
+    logger.info("模板同步入库 %s 条（译文 %s / 保留英文 %s），已存在 %s，过期丢弃 %s，解析失败 %s",
+                len(saved), zh_ok, zh_fail, skipped, expired, failed)
     return {**r.as_dict(), "imported": len(saved), "skipped": skipped,
             "failed": failed, "expired": expired, "translated": zh_ok,
             "files": saved}
@@ -202,14 +210,20 @@ def pull_templates(limit: int = 0, severity: str = "", tag: str = "") -> dict:
 
 
 def run_collect() -> dict:
-    """完整流水线：爬文章 → 抓正文/提 PoC → AI 按公开思路生成 → nuclei 模板 → 落文件库。
+    """完整流水线：爬文章 → 抓正文 → 内容性质判定 → AI 生成 → nuclei 模板 → 落文件库。
 
-    不做"漏洞是否可用"的筛选：抓到就播，可不可用由看到播报的人判断。
+    收录与否分两层：
+    - nuclei 模板库来的条目直接收，模板本身就是最规范的探测逻辑
+    - 文章来的条目先让 LLM 判性质（content_judge.judge）：赛事 WriteUp、工具
+      教程、行业新闻一律不收。判定在抓正文之后、生成之前，省掉一次 LLM 调用
+    - 模型给不出成稿（llm_generate 走了兜底）同样不收，兜底名进库只会污染列表
+
+    判断"漏洞好不好用"仍然交给看到播报的人，模型只负责分清这是不是漏洞情报。
     """
     items = fetch_all()
     llm = get_llm()
     keep_days = config.get("collect", "keep_days") or 0
-    kept = skipped = tpl_ok = tpl_skip = expired = 0
+    kept = skipped = tpl_ok = tpl_skip = expired = rejected = 0
     for it in items:
         if store.get_vuln(it["id"]):        # 已收录 → 去重跳过
             skipped += 1
@@ -226,20 +240,38 @@ def run_collect() -> dict:
             # 够 entry_date 判了。
             if store.too_old(it, keep_days):
                 expired += 1
-                print(f"[skip] {it['id']} 超出保留期（{store.entry_date(it)[0]}）")
+                logger.info("跳过 %s：已超出保留期（%s）", it["id"], store.entry_date(it)[0])
                 continue
             pre_poc = it.pop("_poc", None)  # mock 样本预置的现成 PoC
             content, poc = crawler.fetch_article_content(it.get("link", "")) \
                 if it.get("link") else ("", None)
             poc = poc or pre_poc
 
+            # 内容性质判定。站点是安全社区不代表每篇文章都是漏洞：先知上既有
+            # 漏洞分析也有比赛 WriteUp，只按日期筛会把《XX 大赛 WriteUp》播出去。
+            # 判不准就不收，下一轮再抓；这里没有关键词兜底，因为关键词表写死就
+            # 一定有漏网和误杀。
+            verdict = content_judge.judge(llm, it, content)
+            if not verdict["is_vuln"]:
+                rejected += 1
+                logger.info("不收 %s：%s（%s）", it["id"],
+                            verdict["reason"] or "非漏洞情报", verdict["kind"])
+                continue
+
             gen = llm_generate(llm, it, content, poc)
+            if gen.get("fallback"):
+                rejected += 1
+                logger.warning("不收 %s：内容判定通过，但模型没给出成稿，"
+                               "留着兜底条目只会污染列表", it["id"])
+                continue
+
             # 不硬写 translated：LLM 挂掉时 name 是原文标题（exploit-db 全是英文），
             # 谎报已译会让回填永远跳过它。need_translate 自己按有没有汉字判断。
             meta = {"id": it["id"], "name": gen["name"], "source": it["source"],
                     "summary": gen["summary"], "principle": gen["principle"],
                     "attack_scope": gen["attack_scope"], "cvss": it.get("cvss"),
                     "published": it.get("published", ""), "refs": it.get("refs", []),
+                    "component": verdict["component"],
                     "poc_source": "article" if poc else "ai"}
             poc = gen["poc"]
             yaml_text = ""
@@ -250,17 +282,75 @@ def run_collect() -> dict:
                     tpl_ok += 1
                 else:
                     tpl_skip += 1
-                    print(f"[nuclei] {it['id']} 未生成模板: {r['reason']}")
+                    logger.info("%s 未生成模板：%s", it["id"], r["reason"])
 
         if store.too_old(meta, keep_days):   # 模板条目的日期要等 from_template 出来才有
             expired += 1
-            print(f"[skip] {it['id']} 超出保留期（{store.entry_date(meta)[0]}）")
+            logger.info("跳过 %s：已超出保留期（%s）", it["id"], store.entry_date(meta)[0])
             continue
         if tpl is not None:
             translate.translate_and_fill(meta, llm)   # 模板条目是英文，入库前先中文化
         vid = store.save(meta, poc, "python", yaml_text)
-        print(f"[saved] {vid} :: {meta['name']}  poc_source={meta['poc_source']}"
-              f"  nuclei={'有' if yaml_text else '无'}")
+        logger.info("已收录 %s :: %s（poc 来源 %s，nuclei 模板 %s）",
+                    vid, meta["name"], meta["poc_source"], "有" if yaml_text else "无")
         kept += 1
     return {"fetched": len(items), "kept": kept, "skipped": skipped,
-            "expired": expired, "nuclei_ok": tpl_ok, "nuclei_skipped": tpl_skip}
+            "expired": expired, "rejected": rejected,
+            "nuclei_ok": tpl_ok, "nuclei_skipped": tpl_skip}
+
+
+def recheck_library(limit: int = 0, llm=None) -> dict:
+    """拿已经收进库的条目重新过一遍内容判定，清掉历史脏数据。
+
+    干两件事：
+    - 判定为非漏洞（赛事 WriteUp、教程、新闻）→ 直接删掉漏洞目录和汇总模板
+    - 判定为漏洞但标题带「（兜底）」→ 模型当时没给出成稿，重新生成一遍并覆盖
+
+    limit=0 表示全库复检；处理量按 limit 截断，够先看效果了。nuclei 模板库
+    来的条目（id 以 nuclei- 开头、poc_source 为 nuclei）跳过复检——模板的
+    名字本来就是漏洞 ID，判了也只会浪费模型配额。
+    """
+    llm = llm or get_llm()
+    metas = store.all_metas()
+    scanned = removed = regenerated = kept = 0
+    removed_ids, failed = [], []
+    for m in metas:
+        if limit and scanned >= limit:
+            break
+        if m.get("poc_source") == "nuclei" or str(m.get("id", "")).startswith("nuclei-"):
+            continue                        # 模板库条目不参与判定
+        scanned += 1
+        # 复检时手上只有 meta，没有正文；name + summary + 原理已经够模型判断性质
+        verdict = content_judge.judge(llm, m, m.get("summary", ""))
+        if not verdict["is_vuln"]:
+            if store.delete_vuln(m["id"]):
+                removed += 1
+                removed_ids.append(m["id"])
+                logger.info("复检删除 %s：%s（%s）", m["id"],
+                            verdict["reason"] or "非漏洞情报", verdict["kind"])
+            else:
+                failed.append(m["id"])
+            continue
+
+        if verdict["component"]:
+            store.update_meta(m["id"], {"component": verdict["component"]})
+
+        name = str(m.get("name") or "")
+        if "（兜底）" in name:                # 当时模型挂了，重写一遍
+            it = {"id": m["id"], "title": name.replace("（兜底）", "").strip(),
+                  "summary": m.get("summary", ""), "refs": m.get("refs", []),
+                  "cvss": m.get("cvss"), "published": m.get("published", "")}
+            gen = llm_generate(llm, it, "", m.get("_poc_text", ""))
+            if gen.get("fallback"):
+                failed.append(m["id"])
+                continue
+            store.update_meta(m["id"], {
+                "name": gen["name"], "summary": gen["summary"],
+                "principle": gen["principle"], "attack_scope": gen["attack_scope"]})
+            store.save_poc(m["id"], gen["poc"], "python")
+            regenerated += 1
+            logger.info("复检重写 %s → %s", m["id"], gen["name"])
+            continue
+        kept += 1
+    return {"scanned": scanned, "removed": removed, "removed_ids": removed_ids,
+            "regenerated": regenerated, "kept": kept, "failed": failed}

@@ -5,17 +5,21 @@
 nuclei 模板库的主路径是 nuclei_sync.py 的 git 增量同步（独立入口，不过 LLM）；
 这里的本地/远程两条是手动按需取样用的旁路。
 """
+import logging
+
 import config
 import nuclei_tpl
 from config import NUCLEI_CACHE_DIR, NUCLEI_REPO_DIR
 from crawler import fetch_articles
+
+logger = logging.getLogger("ai_bobao.sources")
 
 
 def fetch_nuclei(limit: int = 0) -> list[dict]:
     """已 clone 的本地模板库（data/nuclei_templates，由同步模块维护）。"""
     tpls = nuclei_tpl.load_local_templates(
         NUCLEI_REPO_DIR, limit=limit or config.get("collect", "fetch_limit"))
-    print(f"[source] nuclei 本地 → {len(tpls)} 条")
+    logger.info("nuclei 本地模板 → %s 条", len(tpls))
     return [nuclei_tpl.tpl_to_item(t) for t in tpls]
 
 
@@ -28,7 +32,7 @@ def fetch_nuclei_remote(limit: int = 0, severity: str = "", tag: str = "") -> li
         repo, ref=config.get("nuclei", "ref"),
         limit=limit or config.get("nuclei", "remote_limit"),
         severity=severity, tag=tag, cache_dir=NUCLEI_CACHE_DIR)
-    print(f"[source] nuclei 远程({repo}) → {len(tpls)} 条")
+    logger.info("nuclei 远程模板(%s) → %s 条", repo, len(tpls))
     return [nuclei_tpl.tpl_to_item(t) for t in tpls]
 
 
@@ -40,7 +44,7 @@ def fetch_all() -> list[dict]:
         try:
             items.extend(fn())
         except Exception as e:  # noqa: BLE001
-            print(f"[source] {name} 失败: {e!r}")
+            logger.warning("源 %s 拉取失败：%r", name, e)
     seen, uniq = set(), []
     for it in items:
         if it["id"] and it["id"] not in seen:

@@ -3,6 +3,19 @@
   <head>
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <!--
+      页面级 CSP。样式里要带 'unsafe-inline'，因为 Vue 单文件组件的 <style> 是运行时插进去的；
+      connect-src 里的 ws 是给开发服务器热更新用的。剩下的口子全关：
+      object-src 'none' 挡插件类攻击，base-uri 'none' 挡 <base> 劫持相对地址。
+      真正的接口响应还由后端再补一层更严的 CSP（/api 是 default-src 'none'）。
+    -->
+    <meta
+      http-equiv="Content-Security-Policy"
+      content="default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline';
+               img-src 'self' data:; font-src 'self' data:;
+               connect-src 'self' ws://localhost:5173 ws://127.0.0.1:5173;
+               object-src 'none'; base-uri 'none'; form-action 'self'"
+    />
     <title>AI 漏洞播报系统</title>
   </head>
   <body>
