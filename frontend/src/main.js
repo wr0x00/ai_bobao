@@ -8,16 +8,14 @@ import { createRouter, createWebHistory } from 'vue-router'
 import App from './App.vue'
 import ListView from './ListView.vue'
 import DetailView from './DetailView.vue'
-import OverviewView from './OverviewView.vue'
 import TemplatesView from './TemplatesView.vue'
 import SettingsView from './SettingsView.vue'
 
 const router = createRouter({
     history: createWebHistory(),
     routes: [
-        { path: '/', component: ListView }, // 漏洞列表（首页）
+        { path: '/', component: ListView }, // 漏洞列表（首页，总览面板嵌在其中）
         { path: '/vuln/:id', component: DetailView }, // 漏洞详情
-        { path: '/overview', component: OverviewView }, // 总览（组件 / 平台分布图）
         { path: '/templates', component: TemplatesView }, // nuclei 模板库
         { path: '/settings', component: SettingsView }, // 设置
     ],

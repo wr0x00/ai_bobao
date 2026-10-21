@@ -5,7 +5,6 @@
       <span class="sub">24h 监控 · AI 筛选 · 自动生成 PoC</span>
       <nav>
         <a href="#" :class="{ on: $route.path === '/' }" @click.prevent="goList">漏洞</a>
-        <a href="#" :class="{ on: $route.path === '/overview' }" @click.prevent="$router.push('/overview')">总览</a>
         <a href="#" :class="{ on: $route.path === '/templates' }" @click.prevent="$router.push('/templates')">nuclei 模板库</a>
         <a href="#" :class="{ on: $route.path === '/settings' }" @click.prevent="$router.push('/settings')">设置</a>
         <!-- 仓库图标：点开 GitHub 项目页。图标自己画，不引外部图床，页面 CSP 只放行 self -->
@@ -59,7 +58,8 @@ function goList() {
 <style>
 * { box-sizing: border-box; margin: 0; padding: 0; }
 body { background: #0f1115; color: #e6e6e6; font-family: system-ui, 'Microsoft YaHei', sans-serif; }
-.wrap { max-width: 860px; margin: 0 auto; padding: 24px 16px 60px; }
+/* 页面放宽到 1200px：列表两列 + 总览图表需要更宽的空间 */
+.wrap { max-width: 1200px; margin: 0 auto; padding: 24px 16px 60px; }
 header { margin-bottom: 24px; cursor: default; }
 header h1 { font-size: 22px; cursor: pointer; display: inline-block; }
 header .sub { margin-left: 12px; color: #8b93a1; font-size: 13px; }

@@ -13,6 +13,9 @@
       </div>
     </div>
 
+    <!-- 总览：统计图直接嵌在列表页搜索栏上方，不再单独占一页 -->
+    <OverviewPanel />
+
     <div class="searchbar">
       <input v-model="kw" type="search" placeholder="搜索标题、CVE 编号、漏洞原理…（空格分隔多个关键词）"
              @keyup.enter="search" />
@@ -30,16 +33,18 @@
     <div v-if="error" class="error">加载失败：{{ error }}</div>
     <div v-else-if="!items.length" class="empty">{{ kw ? `没有匹配「${kw}」的漏洞。` : '该栏目暂无漏洞。' }}</div>
 
-    <div v-for="v in items" :key="v.id" class="card" @click="openVuln(v.id)">
-      <div class="row">
-        <span class="name">{{ v.name }}</span>
-        <span v-if="!v.translated" class="needzh" title="标题/简介还是英文">EN</span>
-        <span class="badge" :data-src="v.source">{{ v.source }}</span>
-        <span v-if="v.has_nuclei" class="tpl">nuclei</span>
-        <span v-if="v.cvss" class="cvss" :class="{ high: v.cvss >= 9 }">CVSS {{ v.cvss }}</span>
-        <span v-if="v.entry_date" class="date">{{ v.entry_date }}</span>
+    <div class="vgrid">
+      <div v-for="v in items" :key="v.id" class="card" @click="openVuln(v.id)">
+        <div class="row">
+          <span class="name">{{ v.name }}</span>
+          <span v-if="!v.translated" class="needzh" title="标题/简介还是英文">EN</span>
+          <span class="badge" :data-src="v.source">{{ v.source }}</span>
+          <span v-if="v.has_nuclei" class="tpl">nuclei</span>
+          <span v-if="v.cvss" class="cvss" :class="{ high: v.cvss >= 9 }">CVSS {{ v.cvss }}</span>
+          <span v-if="v.entry_date" class="date">{{ v.entry_date }}</span>
+        </div>
+        <p class="summary">{{ v.summary }}</p>
       </div>
-      <p class="summary">{{ v.summary }}</p>
     </div>
 
     <div v-if="pages > 1" class="pager">
@@ -60,8 +65,9 @@
 import { computed, onBeforeUnmount, onMounted, ref, watch } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
 import { backfillTranslate, collectStatus, listVulns, llmStatus, runCollect } from './api'
+import OverviewPanel from './OverviewPanel.vue'
 
-const PAGE_SIZE = 10          // 一页 10 条
+const PAGE_SIZE = 20          // 一页 20 条：两列布局下正好 10 行
 
 const route = useRoute()
 const router = useRouter()
@@ -288,7 +294,10 @@ button:disabled { background: #374151; cursor: not-allowed; }
 .tab.active { background: #1d4ed8; color: #fff; border-color: #1d4ed8; }
 .tab.active i { color: #bfdbfe; }
 
-.card { background: #171a21; border: 1px solid #262b36; border-radius: 10px; padding: 14px 16px; margin-bottom: 12px; cursor: pointer; transition: border-color .15s; }
+/* 漏洞卡片两列网格：页面放宽后单列太空，两列一屏能看更多。
+   minmax(0,1fr) 防止长标题把列撑破；窄屏退回单列。 */
+.vgrid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 12px; margin-bottom: 12px; }
+.card { background: #171a21; border: 1px solid #262b36; border-radius: 10px; padding: 14px 16px; cursor: pointer; transition: border-color .15s; }
 .card:hover { border-color: #3b82f6; }
 .row { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; }
 .name { font-weight: 600; font-size: 15px; flex: 1; min-width: 200px; }
@@ -310,4 +319,8 @@ button:disabled { background: #374151; cursor: not-allowed; }
 .pager { display: flex; align-items: center; justify-content: center; gap: 14px; margin: 20px 0 8px; color: #8b93a1; font-size: 13px; }
 .pager b { color: #e6e6e6; }
 .pager button { padding: 6px 14px; font-size: 13px; }
+
+@media (max-width: 860px) {
+  .vgrid { grid-template-columns: 1fr; }
+}
 </style>
