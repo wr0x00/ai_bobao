@@ -1,6 +1,8 @@
 <template>
   <div class="wrap">
     <header>
+      <!-- 站点图标：跟仓库头像同一套视觉，盾形 + 神经网络节点 -->
+      <img class="logo" src="/icon-mini.svg" alt="AI 漏洞播报" width="30" height="30" />
       <h1 @click="goList">AI 漏洞播报</h1>
       <span class="sub">24h 监控 · AI 筛选 · 自动生成 PoC</span>
       <nav>
@@ -62,6 +64,8 @@ body { background: #0f1115; color: #e6e6e6; font-family: system-ui, 'Microsoft Y
 .wrap { max-width: 1200px; margin: 0 auto; padding: 24px 16px 60px; }
 header { margin-bottom: 24px; cursor: default; }
 header h1 { font-size: 22px; cursor: pointer; display: inline-block; }
+/* 站点图标：跟标题文字对齐，垂直居中 */
+header .logo { width: 30px; height: 30px; vertical-align: -5px; margin-right: 10px; border-radius: 7px; }
 header .sub { margin-left: 12px; color: #8b93a1; font-size: 13px; }
 header nav { float: right; display: flex; align-items: center; gap: 14px; font-size: 13px; }
 header nav a { color: #8b93a1; display: inline-flex; align-items: center; }

@@ -1,0 +1,90 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512" width="512" height="512" role="img" aria-label="AI 漏洞播报">
+  <title>AI 漏洞播报</title>
+  <defs>
+    <!-- 底板：从左上到右下的深蓝黑渐变，和前端 #0f1115 底色同一色系 -->
+    <linearGradient id="bg" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#1b2233"/>
+      <stop offset="0.55" stop-color="#11151f"/>
+      <stop offset="1" stop-color="#0b0e15"/>
+    </linearGradient>
+    <!-- 主色蓝，用于雷达扫掠与护盾 -->
+    <linearGradient id="blue" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#7cc0ff"/>
+      <stop offset="1" stop-color="#3d7dff"/>
+    </linearGradient>
+    <!-- 扫描扇形渐隐 -->
+    <linearGradient id="sweep" x1="0" y1="0" x2="1" y2="0">
+      <stop offset="0" stop-color="#5aa7ff" stop-opacity="0.55"/>
+      <stop offset="1" stop-color="#5aa7ff" stop-opacity="0"/>
+    </linearGradient>
+    <radialGradient id="glow" cx="0.5" cy="0.42" r="0.62">
+      <stop offset="0" stop-color="#5aa7ff" stop-opacity="0.30"/>
+      <stop offset="0.6" stop-color="#5aa7ff" stop-opacity="0.07"/>
+      <stop offset="1" stop-color="#5aa7ff" stop-opacity="0"/>
+    </radialGradient>
+    <clipPath id="round">
+      <rect x="0" y="0" width="512" height="512" rx="112"/>
+    </clipPath>
+  </defs>
+
+  <g clip-path="url(#round)">
+    <rect width="512" height="512" fill="url(#bg)"/>
+    <rect width="512" height="512" fill="url(#glow)"/>
+
+    <!-- 雷达同心环：漏洞平台持续监控的隐喻 -->
+    <g fill="none" stroke="#5aa7ff" stroke-opacity="0.16" stroke-width="2">
+      <circle cx="256" cy="256" r="196"/>
+      <circle cx="256" cy="256" r="150"/>
+      <circle cx="256" cy="256" r="104"/>
+      <circle cx="256" cy="256" r="58"/>
+    </g>
+    <!-- 十字准线 -->
+    <g stroke="#5aa7ff" stroke-opacity="0.10" stroke-width="2">
+      <line x1="60" y1="256" x2="452" y2="256"/>
+      <line x1="256" y1="60" x2="256" y2="452"/>
+    </g>
+
+    <!-- 扫描扇形：自左侧扫向右侧，带渐隐拖尾 -->
+    <g transform="rotate(-18 256 256)">
+      <path d="M256 256 L256 60 A196 196 0 0 1 405 128 Z" fill="url(#sweep)"/>
+      <line x1="256" y1="256" x2="256" y2="60" stroke="#9ed0ff" stroke-opacity="0.85" stroke-width="3" stroke-linecap="round"/>
+    </g>
+
+    <!-- 命中点：扫描线上被捕获的漏洞 -->
+    <g>
+      <circle cx="352" cy="152" r="7" fill="#f87171"/>
+      <circle cx="352" cy="152" r="13" fill="none" stroke="#f87171" stroke-opacity="0.45" stroke-width="2"/>
+      <circle cx="186" cy="330" r="5" fill="#fbbf24"/>
+      <circle cx="186" cy="330" r="10" fill="none" stroke="#fbbf24" stroke-opacity="0.40" stroke-width="2"/>
+    </g>
+
+    <!-- 中央护盾：安全语义 -->
+    <g transform="translate(256 250)">
+      <path d="M0 -104 L86 -68 V4 C86 58 50 92 0 112 C-50 92 -86 58 -86 4 V-68 Z"
+            fill="#0d1119" fill-opacity="0.92" stroke="url(#blue)" stroke-width="9" stroke-linejoin="round"/>
+      <!-- 护盾内的 AI 神经网络节点：三条连线 + 五个节点 -->
+      <g stroke="#5aa7ff" stroke-opacity="0.85" stroke-width="6" stroke-linecap="round">
+        <line x1="-34" y1="-34" x2="0" y2="4"/>
+        <line x1="34" y1="-34" x2="0" y2="4"/>
+        <line x1="0" y1="4" x2="-30" y2="46"/>
+        <line x1="0" y1="4" x2="30" y2="46"/>
+      </g>
+      <g>
+        <circle cx="-34" cy="-34" r="13" fill="#7cc0ff"/>
+        <circle cx="34" cy="-34" r="13" fill="#7cc0ff"/>
+        <circle cx="0" cy="4" r="16" fill="#ffffff"/>
+        <circle cx="-30" cy="46" r="11" fill="#f472b6"/>
+        <circle cx="30" cy="46" r="11" fill="#f472b6"/>
+      </g>
+    </g>
+
+    <!-- 底部波纹：全网抓取的数据流 -->
+    <g fill="none" stroke="#5aa7ff" stroke-opacity="0.22" stroke-width="5" stroke-linecap="round">
+      <path d="M170 396 q20 -20 40 0 t40 0 t40 0 t40 0"/>
+      <path d="M190 428 q18 -18 36 0 t36 0 t36 0 t36 0" stroke-opacity="0.14"/>
+    </g>
+  </g>
+
+  <!-- 外框描边 -->
+  <rect x="4" y="4" width="504" height="504" rx="108" fill="none" stroke="#5aa7ff" stroke-opacity="0.22" stroke-width="8"/>
+</svg>

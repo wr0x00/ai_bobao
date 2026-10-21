@@ -17,6 +17,20 @@
                object-src 'none'; base-uri 'none'; form-action 'self'"
     />
     <title>AI 漏洞播报系统</title>
+    <!--
+      图标走自带的 public 目录，不引 CDN。favicon 用简化版（icon-mini），
+      小尺寸下细节才不会糊；apple-touch-icon 用同一张。
+    -->
+    <link rel="icon" type="image/svg+xml" href="/icon-mini.svg" />
+    <link rel="alternate icon" type="image/png" sizes="32x32" href="/favicon-32.png" />
+    <link rel="apple-touch-icon" href="/apple-touch-icon.png" />
+    <meta name="theme-color" content="#0f1115" />
+    <meta name="description" content="AI 赋能的漏洞播报系统：24 小时监控全网漏洞源，自动生成 PoC、漏洞原理与 nuclei 模板。" />
+    <!-- GitHub 社交预览图 -->
+    <meta property="og:title" content="AI 漏洞播报 · AI-Powered Vulnerability Intelligence Feed" />
+    <meta property="og:description" content="24 小时监控全网漏洞源，LLM 内容判定后自动生成 PoC、漏洞原理与 nuclei 模板。" />
+    <meta property="og:image" content="/preview.png" />
+    <meta name="twitter:card" content="summary_large_image" />
   </head>
   <body>
     <div id="app"></div>

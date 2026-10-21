@@ -4,6 +4,8 @@
 
 [简体中文](README.md) · English
 
+![AI Vulnerability Broadcast](preview.png)
+
 An AI-powered vulnerability broadcast system that monitors vulnerability disclosures around the clock. AI generates PoCs, summaries, root causes and attack surfaces from publicly disclosed exploitation logic, and stores them automatically.
 
 ---
