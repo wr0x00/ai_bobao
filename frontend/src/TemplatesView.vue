@@ -211,11 +211,11 @@ onMounted(() => { loadLocal(); loadSync() })
 
 .toolbar { display: flex; justify-content: space-between; align-items: center; flex-wrap: wrap; gap: 10px; margin-bottom: 12px; }
 .tabs { display: flex; gap: 8px; }
-.tab { background: #171a21; color: #9ca3af; border: 1px solid #262b36; border-radius: 999px;
+.tab { background: #171a21; color: #9ca3af; border: 1px solid #262b36; border-radius: 0;
   padding: 5px 13px; font-size: 13px; cursor: pointer; }
 .tab i { font-style: normal; margin-left: 6px; color: #6b7280; font-size: 11px; }
-.tab.active { background: #1d4ed8; color: #fff; border-color: #1d4ed8; }
-.tab.active i { color: #bfdbfe; }
+.tab.active { background: #0ea5e9; color: #fff; border-color: #0ea5e9; }
+.tab.active i { color: #e0f2fe; }
 .hint { color: #6b7280; font-size: 12px; }
 .hint code { background: #171a21; padding: 1px 5px; border-radius: 4px; }
 
@@ -223,9 +223,13 @@ onMounted(() => { loadLocal(); loadSync() })
 select, input { background: #171a21; color: #e6e6e6; border: 1px solid #262b36; border-radius: 6px;
   padding: 7px 10px; font-size: 13px; }
 input[type="number"] { width: 76px; }
-button { background: #262b36; color: #e6e6e6; border: 0; border-radius: 6px; padding: 7px 14px; font-size: 13px; cursor: pointer; }
-button.primary { background: #2563eb; color: #fff; }
-button:disabled { background: #374151; cursor: wait; }
+/* 按钮基调：方角 + 天蓝主色（与列表页一致） */
+button { background: #171a21; color: #7dd3fc; border: 1px solid #1e4964; border-radius: 0;
+  padding: 7px 14px; font-size: 13px; cursor: pointer; }
+button:hover { color: #bae6fd; border-color: #38bdf8; }
+button.primary { background: #0ea5e9; color: #fff; border-color: #0ea5e9; }
+button.primary:hover { background: #38bdf8; }
+button:disabled { background: #374151; color: #cbd5e1; cursor: wait; border-color: #374151; }
 
 .msg { color: #34d399; font-size: 13px; margin-bottom: 10px; }
 .error { color: #f87171; margin: 12px 0; }
@@ -233,15 +237,16 @@ button:disabled { background: #374151; cursor: wait; }
 
 .card { background: #171a21; border: 1px solid #262b36; border-radius: 10px; padding: 14px 16px; margin-bottom: 12px; }
 .card.link { cursor: pointer; }
-.card.link:hover { border-color: #3b82f6; }
+.card.link:hover { border-color: #38bdf8; }
 .row { display: flex; align-items: center; gap: 10px; }
 .name { font-weight: 600; font-size: 15px; flex: 1; }
-.sev { font-size: 11px; padding: 2px 8px; border-radius: 999px; background: #262b36; color: #9ca3af; text-transform: uppercase; }
-.sev[data-sev="critical"] { color: #f87171; }
-.sev[data-sev="high"] { color: #fb923c; }
-.sev[data-sev="medium"] { color: #fbbf24; }
-.sev[data-sev="low"] { color: #60a5fa; }
-.sev[data-sev="info"] { color: #9ca3af; }
+/* 严重级别色块：底色深色 + 前景亮色，跟列表页评级色块同一套语义色 */
+.sev { font-size: 11px; padding: 2px 8px; border-radius: 3px; background: #262b36; color: #9ca3af; text-transform: uppercase; }
+.sev[data-sev="critical"] { background: #7f1d1d; color: #fca5a5; }
+.sev[data-sev="high"] { background: #7c2d12; color: #fdba74; }
+.sev[data-sev="medium"] { background: #1e3a8a; color: #bfdbfe; }
+.sev[data-sev="low"] { background: #0c4a6e; color: #bae6fd; }
+.sev[data-sev="info"] { background: #262b36; color: #9ca3af; }
 .req { font-size: 11px; color: #6b7280; }
 .desc { margin-top: 8px; color: #9ca3af; font-size: 13px; line-height: 1.6;
   display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical; overflow: hidden; }

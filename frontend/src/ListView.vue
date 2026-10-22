@@ -19,8 +19,19 @@
     <div class="searchbar">
       <input v-model="kw" type="search" placeholder="搜索标题、CVE 编号、漏洞原理…（空格分隔多个关键词）"
              @keyup.enter="search" />
-      <button class="ghost" :disabled="!kw" @click="kw = ''; search()">清空</button>
-      <span v-if="kw" class="hit">命中 {{ total }} 条</span>
+      <select v-model="level" class="flt" title="按漏洞评级筛选" @change="applyFilter">
+        <option value="">全部评级</option>
+        <option v-for="l in LEVELS" :key="l" :value="l">{{ l }}</option>
+      </select>
+      <select v-model.number="days" class="flt" title="按更新时间筛选（最近 N 天）" @change="applyFilter">
+        <option :value="0">全部时间</option>
+        <option :value="1">今天</option>
+        <option :value="3">近 3 天</option>
+        <option :value="7">近 7 天</option>
+        <option :value="30">近 30 天</option>
+      </select>
+      <button class="ghost" :disabled="!kw && !level && !days" @click="clearAll">清空</button>
+      <span v-if="kw || level || days" class="hit">命中 {{ total }} 条</span>
     </div>
 
     <div class="tabs">
@@ -37,11 +48,12 @@
       <div v-for="v in items" :key="v.id" class="card" @click="openVuln(v.id)">
         <div class="row">
           <span class="name">{{ v.name }}</span>
+          <span class="lvl" :data-lv="v.level" :title="LVLTIP[v.level]">{{ v.level }}</span>
           <span v-if="!v.translated" class="needzh" title="标题/简介还是英文">EN</span>
           <span class="badge" :data-src="v.source">{{ v.source }}</span>
           <span v-if="v.has_nuclei" class="tpl">nuclei</span>
           <span v-if="v.cvss" class="cvss" :class="{ high: v.cvss >= 9 }">CVSS {{ v.cvss }}</span>
-          <span v-if="v.entry_date" class="date">{{ v.entry_date }}</span>
+          <span class="date">更新 {{ (v.updated || v.entry_date || '').slice(0, 10) }}</span>
         </div>
         <p class="summary">{{ v.summary }}</p>
       </div>
@@ -66,6 +78,7 @@ import { computed, onBeforeUnmount, onMounted, ref, watch } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
 import { backfillTranslate, collectStatus, listVulns, llmStatus, runCollect } from './api'
 import OverviewPanel from './OverviewPanel.vue'
+import { LVLTIP } from './rating'
 
 const PAGE_SIZE = 20          // 一页 20 条：两列布局下正好 10 行
 
@@ -83,6 +96,10 @@ const error = ref('')
 const collecting = ref(false)
 const cur = ref(String(route.query.source || '全部'))
 const kw = ref(String(route.query.q || ''))   // 搜索框内容，回车/清空时才真正拿去查
+// 过滤器：评级 + 更新时间范围。初值也从 URL 里取，刷新后筛选状态不丢
+const LEVELS = ['严重', '高危', '中危', '低危', '未评级']
+const level = ref(String(route.query.level || ''))
+const days = ref(Math.max(0, parseInt(route.query.days, 10) || 0))
 const st = ref(null)
 const llmOk = ref(true)         // LLM 不可用时置灰 AI 按钮
 const translating = ref(false)
@@ -130,6 +147,8 @@ async function load() {
       page: page.value, page_size: PAGE_SIZE,
       source: cur.value === '全部' ? '' : cur.value,
       q: kw.value.trim(),
+      level: level.value,
+      days: days.value || undefined,
     })
     items.value = r.items
     counts.value = r.counts || {}
@@ -156,6 +175,8 @@ function currentQuery() {
   if (kw.value.trim()) q.q = kw.value.trim()
   if (cur.value !== '全部') q.source = cur.value
   if (page.value > 1) q.page = String(page.value)
+  if (level.value) q.level = level.value
+  if (days.value) q.days = String(days.value)
   return q
 }
 
@@ -214,6 +235,21 @@ function search() {
   load()
 }
 
+/** 切换评级/时间筛选。跟搜索一样要回第一页，不然停在新筛选不存在的那一页。 */
+function applyFilter() {
+  page.value = 1
+  load()
+}
+
+/** 清空整条查询栏：关键词 + 评级 + 时间一起复位。 */
+function clearAll() {
+  kw.value = ''
+  level.value = ''
+  days.value = 0
+  page.value = 1
+  load()
+}
+
 /** 把本页所有英文漏洞交给后端批量翻译。 */
 async function translatePage() {
   translating.value = true
@@ -257,10 +293,15 @@ watch(() => route.query, (q) => {
   const nq = String(q.q || '')
   const nsrc = String(q.source || '全部')
   const np = Math.max(1, parseInt(q.page, 10) || 1)
-  if (nq === kw.value.trim() && nsrc === cur.value && np === page.value) return
+  const nl = String(q.level || '')
+  const nd = Math.max(0, parseInt(q.days, 10) || 0)
+  if (nq === kw.value.trim() && nsrc === cur.value && np === page.value
+      && nl === level.value && nd === days.value) return
   kw.value = nq
   cur.value = nsrc
   page.value = np
+  level.value = nl
+  days.value = nd
   load()
 })
 
@@ -271,8 +312,11 @@ onBeforeUnmount(() => clearInterval(timer))
 <style scoped>
 .toolbar { display: flex; justify-content: space-between; align-items: center; margin-bottom: 12px; color: #8b93a1; font-size: 13px; gap: 12px; }
 .btns { display: flex; gap: 8px; }
-button { background: #2563eb; color: #fff; border: 0; border-radius: 6px; padding: 8px 14px; cursor: pointer; }
-button.ghost { background: #171a21; color: #9ca3af; border: 1px solid #262b36; }
+/* ── 按钮基调：方角 + 天蓝主色，页面背景仍是黑 ── */
+button { background: #0ea5e9; color: #fff; border: 0; border-radius: 0; padding: 8px 14px; cursor: pointer; }
+button:hover { background: #38bdf8; }
+button.ghost { background: #171a21; color: #7dd3fc; border: 1px solid #1e4964; }
+button.ghost:hover { background: #171a21; color: #bae6fd; border-color: #38bdf8; }
 button:disabled { background: #374151; cursor: not-allowed; }
 .error { color: #f87171; margin: 12px 0; }
 .empty { color: #8b93a1; padding: 40px 0; text-align: center; }
@@ -282,25 +326,36 @@ button:disabled { background: #374151; cursor: not-allowed; }
    给个 320px 的上限，窄屏再 flex-shrink 缩下去。 */
 .searchbar input { flex: 0 1 320px; min-width: 160px; background: #171a21; color: #e6e6e6;
   border: 1px solid #262b36; border-radius: 6px; padding: 8px 12px; font-size: 13px; outline: none; }
-.searchbar input:focus { border-color: #3b82f6; }
+/* 过滤下拉：与搜索框同一套暗底；focus 用天蓝，呼应全站主色 */
+.searchbar .flt { background: #171a21; color: #e6e6e6; border: 1px solid #262b36;
+  border-radius: 6px; padding: 7px 8px; font-size: 13px; outline: none; cursor: pointer; }
+.searchbar .flt:focus, .searchbar input:focus { border-color: #38bdf8; }
+.searchbar .flt option { background: #171a21; }
 .searchbar input::placeholder { color: #6b7280; }
 .searchbar button { padding: 8px 14px; font-size: 13px; }
 .hit { color: #8b93a1; font-size: 13px; white-space: nowrap; }
 
 .tabs { display: flex; flex-wrap: wrap; gap: 8px; margin-bottom: 16px; }
-.tab { background: #171a21; color: #9ca3af; border: 1px solid #262b36; border-radius: 999px;
+.tab { background: #171a21; color: #9ca3af; border: 1px solid #262b36; border-radius: 0;
   padding: 5px 13px; font-size: 13px; cursor: pointer; }
 .tab i { font-style: normal; margin-left: 6px; color: #6b7280; font-size: 11px; }
-.tab.active { background: #1d4ed8; color: #fff; border-color: #1d4ed8; }
-.tab.active i { color: #bfdbfe; }
+.tab.active { background: #0ea5e9; color: #fff; border-color: #0ea5e9; }
+.tab.active i { color: #e0f2fe; }
 
 /* 漏洞卡片两列网格：页面放宽后单列太空，两列一屏能看更多。
    minmax(0,1fr) 防止长标题把列撑破；窄屏退回单列。 */
 .vgrid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 12px; margin-bottom: 12px; }
 .card { background: #171a21; border: 1px solid #262b36; border-radius: 10px; padding: 14px 16px; cursor: pointer; transition: border-color .15s; }
-.card:hover { border-color: #3b82f6; }
+.card:hover { border-color: #38bdf8; }
 .row { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; }
 .name { font-weight: 600; font-size: 15px; flex: 1; min-width: 200px; }
+/* 评级色块：小圆角长方形，悬停 title 给出该级完整说明 */
+.lvl { font-size: 11px; padding: 2px 8px; border-radius: 3px; color: #fff; flex: none; cursor: help; }
+.lvl[data-lv="严重"] { background: #dc2626; }
+.lvl[data-lv="高危"] { background: #ea580c; }
+.lvl[data-lv="中危"] { background: #1d4ed8; }
+.lvl[data-lv="低危"] { background: #0ea5e9; }
+.lvl[data-lv="未评级"] { background: #262b36; color: #8b93a1; cursor: default; }
 .badge { font-size: 11px; padding: 2px 8px; border-radius: 999px; background: #262b36; color: #9ca3af; }
 .badge[data-src="nvd"] { color: #60a5fa; }
 .badge[data-src="nuclei-git"] { color: #34d399; }

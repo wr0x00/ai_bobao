@@ -60,6 +60,29 @@ class LLM:
         content = json.loads(raw)["choices"][0]["message"]["content"]
         return json.loads(content)
 
+    def chat_messages(self, messages: list[dict]) -> str:
+        """多轮对话版：agent 用。整份 messages 原样发出，回原文不解析——
+        agent 里的回复要么是协议 JSON、要么要当裸文本兜底，解析交给调用方。"""
+        endpoint = f"{self.base}/v1/chat/completions"
+        security.check_url(endpoint)
+
+        body = json.dumps({
+            "model": self.model,
+            "messages": messages,
+            "response_format": {"type": "json_object"},
+        }).encode()
+        raw = security.open_url(
+            endpoint,
+            timeout=config.get("llm", "timeout"),
+            max_bytes=MAX_REPLY,
+            method="POST",
+            data=body,
+            headers={"Content-Type": "application/json",
+                     "User-Agent": _UA,
+                     "Authorization": f"Bearer {self.key}"},
+        )
+        return str(json.loads(raw)["choices"][0]["message"]["content"] or "")
+
     def ping(self) -> str:
         """连通性自检：让模型回一个 JSON 探针，验证地址/密钥/模型三项都对。"""
         r = self.chat("只返回 JSON，不要任何解释。",

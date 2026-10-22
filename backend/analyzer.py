@@ -30,14 +30,39 @@ from sources import fetch_all, fetch_nuclei_remote
 
 logger = logging.getLogger("ai_bobao.analyzer")
 
+# 评级标准（四档边界写死，防止模型把所有东西都评成高危）。AI 生成情报、
+# 存量条目回填评级两处共用这一份，改标准只动这里。
+_RATE_RULES = (
+    "严重=能直接拿下重要服务器/客户端的远程代码执行（任意命令执行、上传 webshell、"
+    "可利用的远程缓冲区溢出/内核代码执行/浏览器 UAF），或直接造成严重信息泄漏"
+    "（重要系统可拖走大量数据的 SQL 注入）、直接拿到目标单位核心机密；"
+    "高危=能直接拿到普通系统权限（远程命令/代码执行、上传 webshell、溢出），"
+    "或严重逻辑/流程缺陷（任意账号密码修改、重要业务配置修改或泄露）、"
+    "可批量盗取用户身份（普通系统 SQL 注入、用户订单遍历）、严重权限绕过"
+    "（绕过认证直接进管理后台、cookie 欺骗）、运维相关未授权访问（后台弱口令、服务未授权）；"
+    "中危=有条件限制下才能拿服务器/网站权限或核心数据库数据（交互性代码执行、"
+    "一定条件下的注入、特定版本 getshell），或任意文件操作（任意写/删除/下载、"
+    "敏感文件读取），或水平权限绕过（绕过限制改用户资料、执行用户操作）；"
+    "低危=只能拿到少量非核心数据、苛刻条件下才影响核心数据/业务、"
+    "或需要用户交互才触发（典型如 XSS）。"
+)
+
+_LEVELS_OK = ("严重", "高危", "中危", "低危")
+
 _GENERATE_SYS = (
     "你是资深安全研究员，为漏洞播报系统生成结构化情报，内容仅用于防御研究与"
     "授权测试教育目的。根据文章信息只返回 JSON："
     '{"name": "中文漏洞名称", "summary": "一句话简介", '
     '"principle": "漏洞原理，2-4句", "attack_scope": "攻击范围/影响面", '
-    '"poc": "python 概念验证代码，带注释", "poc_lang": "python"}。'
+    '"poc": "python 概念验证代码，带注释", "poc_lang": "python", '
+    '"level": "评级，严重|高危|中危|低危 四选一"}。'
     "若用户消息里给了 article_poc，则 poc 字段必须原样使用它，不要改写。"
+    "评级按这条标准：" + _RATE_RULES
 )
+
+# 存量回填专用的轻提示：只要评级，不要成稿
+_RATE_SYS = ("你是漏洞评级员。看漏洞信息只返回 JSON："
+             '{"level": "严重|高危|中危|低危"}。评级标准：' + _RATE_RULES)
 
 
 def _brief(item: dict, content: str) -> str:
@@ -123,6 +148,8 @@ def from_template(tpl, vid: str = "", published: str = "") -> tuple[dict, str, s
             "attack_scope": f"协议：{', '.join(tpl.extra.get('protocols') or ['-'])}；"
                             f"严重性：{tpl.severity}",
             "refs": tpl.refs[:8], "poc_source": "nuclei",
+            # 模板自带 EN 级别（critical/high/...），store.level_of 映射成中文评级
+            "severity": tpl.severity,
             "note": "来自 nuclei 模板库，原样收录"}
     if vid:
         meta["id"] = vid
@@ -267,9 +294,12 @@ def run_collect() -> dict:
 
             # 不硬写 translated：LLM 挂掉时 name 是原文标题（exploit-db 全是英文），
             # 谎报已译会让回填永远跳过它。need_translate 自己按有没有汉字判断。
+            # level 只收认可的四个值；模型给了奇怪的值就留空，落库后按 CVSS 划线兜底
+            lv = str(gen.get("level") or "").strip()
             meta = {"id": it["id"], "name": gen["name"], "source": it["source"],
                     "summary": gen["summary"], "principle": gen["principle"],
                     "attack_scope": gen["attack_scope"], "cvss": it.get("cvss"),
+                    "level": lv if lv in _LEVELS_OK else "",
                     "published": it.get("published", ""), "refs": it.get("refs", []),
                     "component": verdict["component"],
                     "poc_source": "article" if poc else "ai"}
@@ -294,9 +324,53 @@ def run_collect() -> dict:
         logger.info("已收录 %s :: %s（poc 来源 %s，nuclei 模板 %s）",
                     vid, meta["name"], meta["poc_source"], "有" if yaml_text else "无")
         kept += 1
+    try:
+        rate_backfill(llm, limit=20)     # 抓取轮顺手给存量补评级；独立试错不影响主流程
+    except Exception as e:  # noqa: BLE001 —— 评级是锦上添花，绝不让整轮报错
+        logger.warning("存量评级补全中断：%r", e)
     return {"fetched": len(items), "kept": kept, "skipped": skipped,
             "expired": expired, "rejected": rejected,
             "nuclei_ok": tpl_ok, "nuclei_skipped": tpl_skip}
+
+
+# 评过失败/无效回答的条目记在内存里，本轮进程内不再重试，免得每次抓取
+# 都在同一批最难的条目上空烧额度。重启进程（每天一关一开）会重新给机会。
+_RATE_TRIED: set[str] = set()
+
+
+def rate_backfill(llm: LLM | None = None, limit: int = 20) -> int:
+    """给存量没有可靠评级的条目按标准补 level，返回本轮评上的条数。
+
+    每条只要一个词的答案，prompt 很短；失败/模型跑偏就跳过并标记已试，
+    下一轮抓取继续补下一批。limit 控制单轮的调用数（默认 20），
+    全靠多轮积少成多补完整个库，不指望一口气评完 800+ 条。
+    """
+    todo = store.ids_missing_level(limit + len(_RATE_TRIED))
+    todo = [vid for vid in todo if vid not in _RATE_TRIED][:limit]
+    if not todo:
+        return 0
+    llm = llm or get_llm()
+    rated = 0
+    for vid in todo:
+        v = store.get_vuln(vid)
+        if not v:
+            _RATE_TRIED.add(vid)
+            continue
+        brief = json.dumps({"name": v.get("name"),
+                            "summary": str(v.get("summary") or "")[:200],
+                            "principle": str(v.get("principle") or "")[:400]},
+                           ensure_ascii=False)
+        try:
+            r = llm.chat(_RATE_SYS, brief)
+            lv = str(r.get("level") or "").strip()
+            if lv in _LEVELS_OK and store.patch_meta(vid, {"level": lv}):
+                rated += 1
+        except Exception as e:  # noqa: BLE001 —— 单条评级失败只跳过，不抬走整轮
+            logger.debug("评级失败 %s：%r", vid, e)
+        finally:
+            _RATE_TRIED.add(vid)
+    logger.info("存量评级补全 %s/%s 条（已试 %s）", rated, len(todo), len(_RATE_TRIED))
+    return rated
 
 
 def recheck_library(limit: int = 0, llm=None) -> dict:

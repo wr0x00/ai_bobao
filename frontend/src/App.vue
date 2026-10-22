@@ -24,6 +24,7 @@
       </nav>
     </header>
     <router-view />
+    <AgentPanel />
   </div>
 </template>
 
@@ -31,6 +32,7 @@
 import { computed } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
 import { safePath } from './safe'
+import AgentPanel from './AgentPanel.vue'
 
 const route = useRoute()
 const router = useRouter()
@@ -72,4 +74,10 @@ header nav a { color: #8b93a1; display: inline-flex; align-items: center; }
 header nav a.on { color: #e6e6e6; }
 header nav a.gh:hover { color: #e6e6e6; }
 a { color: #5aa7ff; text-decoration: none; }
+
+/* ── 全站按钮基调：一律方角，凸显专业 ──
+   具体的天蓝配色在各组件里上（主色 #0ea5e9、悬停 #38bdf8；
+   次级按钮黑底 + 天蓝描边）。这条是兜底：以后新加按钮忘了写
+   border-radius，也自动是方角圆不回去。 */
+button { border-radius: 0; }
 </style>

@@ -121,13 +121,33 @@ def judge(url: str, titles: list[str]) -> dict:
 
 
 def discover(url: str, llm_judge: bool = True) -> dict:
-    """一步到位：探测 + 判活。返回给设置页预览，不落配置。"""
+    """一步到位：探测 + 判活。返回给设置页预览，不落配置。
+
+    feed 一个都探不到时不急着宣判：用户给的页面本身可能就是能爬的
+    HTML 列表页（补天这种没 feed 但列表是服务端渲染的站），按 HTML
+    适配解析出标题，照样交给 AI 判活。
+    """
     found = probe(url)
     if not found:
-        return {"ok": False,
-                "message": "常见路径都没找到 feed；该站可能是 JS 渲染的列表页，"
-                           "可先在浏览器里找到它的 RSS 地址再填进来",
-                "tried": list(_SUFFIXES), "candidates": []}
+        base = _normalize(url)
+        try:
+            import crawler
+            items = crawler._parse_html_list(_get(base), base, "probe")
+        except Exception:  # noqa: BLE001 —— 拉不下页面/解析不出，走原失败话术
+            items = []
+        titles = [it["title"] for it in items[:8]]
+        if not titles:
+            return {"ok": False,
+                    "message": "常见路径都没找到 feed，页面也解析不出文章链接；"
+                               "该站可能是交互无法爬取的类型，可先在浏览器里"
+                               "找它的 RSS 地址再填进来",
+                    "tried": list(_SUFFIXES), "candidates": []}
+        cand = {"url": base, "entries": len(items), "titles": titles, "kind": "html"}
+        cand["verdict"] = judge(base, titles) if llm_judge else {
+            "is_vuln_source": True, "reason": "未启用 AI 判活", "suggested_name": "",
+            "by_llm": False}
+        return {"ok": True, "candidates": [cand], "best": base,
+                "message": "没找到 feed；已按 HTML 列表页解析（每轮直接抓页面）"}
     # 条目最多的那个最可能是主源，其余留给用户挑
     found.sort(key=lambda f: -f["entries"])
     for f in found:

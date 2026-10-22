@@ -155,3 +155,31 @@ export const checkUpdate = () => req('/api/update/check')
 
 // 拉取最新版本：后端只做 --ff-only 快进，本地有未提交改动会拒绝
 export const applyUpdate = () => post('/api/update/apply')
+
+// ── AI Agent 右侧对话 ───────────────────────────────────
+// messages 只发 user/assistant 的纯文本，工具轨迹在返回的 steps 里；
+// ui 是用户当前停留的界面快照，帮 agent 理解「这一条」「当前页面」这类指代
+export const agentChat = (messages, ui = "") => post('/api/agent/chat', { messages, ui })
+
+// 导出文件下载。接口要求 X-AI-BaoBao 头，裸 <a href> 带不上，走 blob。
+export async function downloadAgentExport(name) {
+    const r = await fetch(`/api/agent/export/${encodeURIComponent(name)}`, {
+        headers: { 'X-AI-BaoBao': '1' },
+        credentials: 'same-origin',
+        cache: 'no-store',
+    })
+    if (!r.ok) {
+        let detail = ''
+        try { detail = (await r.json()).detail || '' } catch { /* 非 JSON 跳过 */ }
+        throw new Error(detail || `下载失败 HTTP ${r.status}`)
+    }
+    const blob = await r.blob()
+    const url = URL.createObjectURL(blob)
+    const a = document.createElement('a')
+    a.href = url
+    a.download = name
+    document.body.appendChild(a)
+    a.click()
+    a.remove()
+    setTimeout(() => URL.revokeObjectURL(url), 5000)
+}

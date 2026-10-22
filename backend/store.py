@@ -130,6 +130,40 @@ def component_of(name: str, vid: str = "") -> str:
     return head[:60] if len(head) >= 3 else ""
 
 
+# ── 评级 ──────────────────────────────────────────────────
+# 评级三条来源，按可靠性排：AI 生成/回填时给的 level、nuclei 模板自带的
+# severity（EN→中文映射）、CVSS 分数划线。都凑不齐就"未评级"，前端给灰块。
+# CVSS 划线按业界惯例：≥9 严重、≥7 高危、≥4 中危、>0 低危。
+_SEV_ZH = {"critical": "严重", "high": "高危", "medium": "中危",
+           "low": "低危", "info": "低危"}
+_LEVELS = ("严重", "高危", "中危", "低危")
+_LEVEL_FILTERS = frozenset((*_LEVELS, "未评级"))   # list_vulns 的 level 参数白名单
+_LEVEL_RANK = {"严重": 0, "高危": 1, "中危": 2, "低危": 3}
+
+
+def level_of(m: dict) -> str:
+    """条目的中文评级。AI 评过的直接用，其次模板 severity，再不行按 CVSS 划。"""
+    lv = str(m.get("level") or "").strip()
+    if lv in _LEVELS:
+        return lv
+    sev = str(m.get("severity") or "").strip().lower()
+    if sev in _SEV_ZH:
+        return _SEV_ZH[sev]
+    try:
+        c = float(m.get("cvss") or 0)
+    except (TypeError, ValueError):
+        c = 0.0
+    if c >= 9:
+        return "严重"
+    if c >= 7:
+        return "高危"
+    if c >= 4:
+        return "中危"
+    if c > 0:
+        return "低危"
+    return "未评级"
+
+
 def _dump(d: Path, meta: dict) -> None:
     (d / "meta.json").write_text(
         json.dumps(meta, ensure_ascii=False, indent=2), encoding="utf-8")
@@ -152,7 +186,9 @@ def save(meta: dict, poc: str, poc_lang: str = "python", nuclei_yaml: str = "") 
     d = security.safe_join(VULN_DIR, vid)
     d.mkdir(parents=True, exist_ok=True)
     meta = {**meta, "id": vid, "poc_file": f"poc.{lang}",
-            "created_at": meta.get("created_at") or _now()}
+            "created_at": meta.get("created_at") or _now(),
+            # 每次写盘都刷新更新时间：入库、重新生成 PoC、补模板都会走到这
+            "updated_at": _now()}
     (d / f"poc.{lang}").write_text(poc, encoding="utf-8")
     if nuclei_yaml:
         meta["nuclei_file"] = "nuclei.yaml"
@@ -212,8 +248,19 @@ def _load_rows_uncached() -> list[dict]:
                      # 编号里只有年份时只显示年份，别拿 12-31 糊弄用户
                      "entry_date": date[:4] if year_only else date,
                      "entry_iso": date or (m.get("created_at") or "")[:10],
+                     # 评级 + 更新时间：列表色块、排序、详情页「更新于」都用它。
+                     # updated 切到分钟，"2026-10-22T09:15" 转成空格分隔好读
+                     "level": level_of(m),
+                     "updated": str(m.get("updated_at")
+                                    or m.get("created_at") or date or "")[:16].replace("T", " "),
                      "_text": _text})
-    rows.sort(key=lambda x: x["entry_iso"], reverse=True)   # 新的在前
+    # 排序两层：主要键更新日期（只看天，新的在前）；次要键评级（高的在前）。
+    # Python 排序稳定，先按评级排一遍，再按更新日排一遍，第二遍不拆第一遍的同分键。
+    for r in rows:
+        r["_upd"] = r["updated"][:10]
+        r["_rank"] = _LEVEL_RANK.get(r["level"], 9)
+    rows.sort(key=lambda x: x["_rank"])
+    rows.sort(key=lambda x: x["_upd"], reverse=True)
     return rows
 
 
@@ -240,12 +287,15 @@ def _load_rows() -> list[dict]:
 
 
 
-def list_vulns(page: int = 1, page_size: int = 10, source: str = "", q: str = "") -> dict:
+def list_vulns(page: int = 1, page_size: int = 10, source: str = "", q: str = "",
+               level: str = "", days: int = 0) -> dict:
     """分页列表。返回 {items, total, page, pages, page_size, all_total, counts}。
 
     前端只渲染当前页，一次传 4000 条没必要。counts 是全库按来源的计数，
     切页签时徽标数字不受分页影响。q 是关键词，在标题/编号/简介/原理里匹配，
     空格分隔的多个词要全部命中（AND）；counts 始终是全库计数，不随关键词变。
+    level 按评级精确筛（只认四档 + 未评级，别的值当没传）；days 取"最近 N 天"
+    （含今天，按更新时间算，和卡片上显示的更新日期同源）。
     """
     rows = _load_rows()
     counts: dict[str, int] = {}
@@ -257,14 +307,59 @@ def list_vulns(page: int = 1, page_size: int = 10, source: str = "", q: str = ""
         rows = [r for r in rows if all(w in r["_text"] for w in words)]
     if source and source != "全部":
         rows = [r for r in rows if r["source"] == source]
+    if level and level != "全部" and level in _LEVEL_FILTERS:
+        rows = [r for r in rows if r["level"] == level]
+    if days and int(days) > 0:
+        # updated 的日期部分是 UTC 日，与列表显示的更新日期同源，直接按字典序比较
+        cutoff = (datetime.now(timezone.utc).date()
+                  - timedelta(days=int(days) - 1)).isoformat()
+        rows = [r for r in rows if r["_upd"] >= cutoff]
     total = len(rows)
     page_size = max(1, min(int(page_size or 10), 100))
     pages = max(1, -(-total // page_size))       # 向上取整
     page = max(1, min(int(page or 1), pages))
-    items = [{k: v for k, v in r.items() if k != "_text"}
+    items = [{k: v for k, v in r.items() if not k.startswith("_")}
              for r in rows[(page - 1) * page_size: page * page_size]]
     return {"items": items, "total": total, "page": page, "pages": pages,
             "page_size": page_size, "all_total": grand_total, "counts": counts}
+
+
+def ids_missing_level(limit: int = 50) -> list[str]:
+    """还没有可靠评级的条目 ID（level/severity/cvss 都凑不齐），给 AI 回填评级用。
+
+    列表本身按「更新时间新的在前」排好，缺评级的老条目自然沉底排前面——先补它们。
+    """
+    out = []
+    for r in _load_rows():
+        if r["level"] != "未评级":
+            continue
+        out.append(r["id"])
+        if len(out) >= limit:
+            break
+    return out
+
+
+def patch_meta(vid: str, updates: dict) -> bool:
+    """就地改一条 meta.json 的部分字段（评级回填用），改完刷新列表缓存。
+
+    不碰 PoC/模板文件，只改 meta；临时文件 + replace 保证半截写不进去。
+    找不到条目返回 False，调用方按跳过处理。
+    """
+    d = security.safe_join(VULN_DIR, security.normalize_vid(vid or ""))
+    f = d / "meta.json" if d else None
+    if not f or not f.is_file():
+        return False
+    try:
+        m = json.loads(f.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return False
+    m.update(updates)
+    m["updated_at"] = _now()
+    tmp = f.with_suffix(".json.tmp")
+    tmp.write_text(json.dumps(m, ensure_ascii=False, indent=2), encoding="utf-8")
+    tmp.replace(f)
+    invalidate_rows()
+    return True
 
 
 def purge_expired(keep_days: int) -> dict:

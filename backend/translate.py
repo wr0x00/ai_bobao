@@ -96,6 +96,7 @@ def translate_one(vid: str) -> dict:
         return {"ok": False, "reason": "AI 未返回完整译文"}
     meta.update(zh)
     meta["translated"] = True
+    meta["updated_at"] = store._now()     # 翻译也算一次更新，排序列要看
     _write(f, meta)
     store.invalidate_rows()
     return {"ok": True, **zh}
@@ -171,6 +172,7 @@ def backfill(limit: int = 20, llm=None, ids: list[str] | None = None) -> dict:
             continue
         meta.update(zh)
         meta["translated"] = True
+        meta["updated_at"] = store._now()     # 批量翻译也刷新更新时间
         _write(f, meta)
         ok.append(vid)
         done.append(zh["name"])

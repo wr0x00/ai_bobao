@@ -195,9 +195,12 @@ onMounted(load)
 .head h2 small { color: #6b7280; font-weight: 400; margin-left: 8px; font-size: 12px; }
 .mini { display: flex; gap: 16px; flex: 1; color: #8b93a1; font-size: 12px; white-space: nowrap; }
 .mini b { color: #e6e6e6; font-variant-numeric: tabular-nums; margin-left: 2px; }
-button { background: #2563eb; color: #fff; border: 0; border-radius: 6px; padding: 5px 12px;
+/* 按钮基调：方角 + 天蓝主色 */
+button { background: #0ea5e9; color: #fff; border: 0; border-radius: 0; padding: 5px 12px;
          cursor: pointer; font-size: 12px; }
-button.ghost { background: #171a21; color: #9ca3af; border: 1px solid #262b36; }
+button:hover { background: #38bdf8; }
+button.ghost { background: #171a21; color: #7dd3fc; border: 1px solid #1e4964; }
+button.ghost:hover { background: #171a21; color: #bae6fd; border-color: #38bdf8; }
 button:disabled { background: #374151; cursor: not-allowed; }
 .error { color: #f87171; margin: 8px 0; }
 .empty { color: #8b93a1; padding: 16px 0; text-align: center; font-size: 13px; }

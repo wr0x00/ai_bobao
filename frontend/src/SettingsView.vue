@@ -493,14 +493,17 @@ input[type="text"], input[type="password"], input:not([type]) {
   padding: 8px 10px; font-size: 13px; width: 100%; }
 input[type="number"] { background: #0f1115; color: #e6e6e6; border: 1px solid #262b36;
   border-radius: 6px; padding: 8px 10px; font-size: 13px; width: 120px; }
-input:focus { outline: none; border-color: #3b82f6; }
-input[type="checkbox"] { accent-color: #2563eb; width: 15px; height: 15px; }
+input:focus { outline: none; border-color: #38bdf8; }
+input[type="checkbox"] { accent-color: #0ea5e9; width: 15px; height: 15px; }
 
 .acts { display: flex; gap: 8px; margin-top: 14px; }
-button { background: #262b36; color: #e6e6e6; border: 0; border-radius: 6px;
+/* 按钮基调：方角 + 天蓝主色 */
+button { background: #171a21; color: #7dd3fc; border: 1px solid #1e4964; border-radius: 0;
   padding: 8px 16px; font-size: 13px; cursor: pointer; }
-button.primary { background: #2563eb; color: #fff; }
-button:disabled { background: #374151; cursor: wait; }
+button:hover { color: #bae6fd; border-color: #38bdf8; }
+button.primary { background: #0ea5e9; color: #fff; border-color: #0ea5e9; }
+button.primary:hover { background: #38bdf8; color: #fff; }
+button:disabled { background: #374151; color: #cbd5e1; cursor: wait; border-color: #374151; }
 
 .ok { color: #34d399; font-size: 13px; margin-top: 10px; }
 .error { color: #f87171; font-size: 13px; margin-bottom: 12px; }
@@ -529,6 +532,6 @@ h4 { font-size: 12px; color: #8b93a1; margin: 18px 0 8px; font-weight: normal; }
 .srcs .nm { white-space: nowrap; width: 1%; }
 .srcs .ur a { color: #60a5fa; word-break: break-all; font-size: 12px; }
 .srcs .op { text-align: right; width: 1%; white-space: nowrap; }
-button.del { background: #3f1d1d; color: #fca5a5; padding: 4px 12px; font-size: 12px; }
+button.del { background: #3f1d1d; color: #fca5a5; border: 0; padding: 4px 12px; font-size: 12px; }
 button.del:hover { background: #5b2626; }
 </style>

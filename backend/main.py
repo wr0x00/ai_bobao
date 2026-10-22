@@ -57,10 +57,11 @@ import uvicorn
 from fastapi import FastAPI, HTTPException, Path, Query, Request
 from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import JSONResponse
+from fastapi.responses import Response, JSONResponse
 from pydantic import BaseModel, Field
 from starlette.middleware.trustedhost import TrustedHostMiddleware
 
+import agent
 import config
 import crawler
 import nuclei_sync
@@ -70,7 +71,8 @@ import source_discovery
 import store
 import translate
 import updater
-from analyzer import gen_poc, pull_templates, recheck_library, run_collect, sync_templates
+from analyzer import (gen_poc, pull_templates, rate_backfill, recheck_library,
+                      run_collect, sync_templates)
 from config import NUCLEI_CACHE_DIR, NUCLEI_TPL_DIR
 from llm import LLM, get_llm
 from store import get_vuln, list_templates, list_vulns
@@ -99,6 +101,8 @@ RATE_HEAVY = 10
 
 # 跑 LLM / git / 联网的重活儿接口，单独最严。它们一次能烧掉真金白银，不能被刷。
 _HEAVY_EXACT = frozenset({
+    "/api/agent/chat",
+    "/api/agent/export",
     "/api/collect",
     "/api/nuclei/sync",
     "/api/nuclei/pull",
@@ -108,6 +112,7 @@ _HEAVY_EXACT = frozenset({
     "/api/translate/backfill",
     "/api/update/apply",
     "/api/vulns/purge",
+    "/api/vulns/rate",
     "/api/vulns/recheck",
 })
 _HEAVY_PREFIX = ("/api/vulns/",)     # 配合 _HEAVY_SUFFIX 用
@@ -414,6 +419,23 @@ class RecheckReq(BaseModel):
     limit: int = Field(default=0, ge=0, le=MAX_RECHECK)     # 0 = 全库
 
 
+class AgentMsg(BaseModel):
+    """对话消息。role 只收 user/assistant，content 长度在 agent 里二次截断。"""
+
+    model_config = {"extra": "forbid"}
+
+    role: str = Field(pattern="^(user|assistant)$")
+    content: str = Field(min_length=1, max_length=agent.MSG_MAX)
+
+
+class AgentChatReq(BaseModel):
+    model_config = {"extra": "forbid"}
+
+    messages: list[AgentMsg] = Field(default_factory=list, max_length=agent.HISTORY_MAX * 2)
+    # 前端随消息带来的界面快照：用户停留在哪个页面/页签。只进 prompt 不落库
+    ui: str = Field(default="", max_length=300)
+
+
 # ── 唯一入口：抓取与同步 ──────────────────────────────────
 def _do_sync(full: bool = False, limit: int = 0) -> dict:
     """模板同步唯一入口：定时任务和手动接口共用，互斥防撞车。"""
@@ -556,9 +578,12 @@ def api_list(
     page_size: int = Query(default=10, ge=1, le=MAX_PAGE_SIZE),
     source: str = Query(default="", max_length=MAX_SOURCE_LEN),
     q: str = Query(default="", max_length=MAX_Q_LEN),
+    level: str = Query(default="", max_length=8),
+    days: int = Query(default=0, ge=0, le=3650),
 ):
-    """漏洞列表（分页）。q 同时搜标题和正文，命中结果由 store 打分排序。"""
-    return list_vulns(page=page, page_size=page_size, source=source, q=q)
+    """漏洞列表（分页）。q 同时搜标题和正文；level/days 按评级、最近 N 天过滤。"""
+    return list_vulns(page=page, page_size=page_size, source=source, q=q,
+                      level=level, days=days)
 
 
 @app.get("/api/vulns/{vid}")
@@ -567,6 +592,8 @@ def api_detail(vid: str = Path(max_length=security.MAX_VID_LEN)):
     v = get_vuln(security.require_vid(vid))
     if not v:
         raise HTTPException(404, "漏洞不存在")
+    # 详情是裸 meta，不保证有 level 字段（老条目没评过）；列表同源的兜底链在这补一份
+    v["level"] = store.level_of(v)
     return v
 
 
@@ -604,6 +631,23 @@ def api_stats():
     """总览页的统计：总数、近 7 天、带 nuclei 模板、已中文化，
     以及按组件（条形图）和按平台（环状图）的分布。"""
     return store.stats()
+
+
+@app.post("/api/vulns/rate")
+async def api_vulns_rate():
+    """手动给存量条目补一轮 AI 评级（每轮抓取结束也会自动评 20 条）。
+
+    逐条调模型，慢，放线程池；跟抓取共用一把锁——两边都在写 meta.json。
+    """
+    if not _collect_lock.acquire(blocking=False):
+        return {"skipped": True, "reason": "已有抓取任务在运行"}
+    try:
+        return {"rated": await asyncio.to_thread(rate_backfill, None, 50)}
+    except Exception:  # noqa: BLE001 —— 完整异常进日志，前端只看一句人话
+        logger.exception("存量评级失败")
+        return {"rated": 0, "error": "评级失败，请查看后端日志"}
+    finally:
+        _collect_lock.release()
 
 
 # ── 抓取 ──────────────────────────────────────────────────
@@ -874,6 +918,49 @@ def api_del_source(name: str = Path(max_length=MAX_SOURCE_LEN)):
     except (ValueError, TypeError) as e:
         raise HTTPException(400, str(e)) from e
     return {"ok": True, "sources": rest, "message": f"已移除 {name}"}
+
+
+# ── AI Agent 对话 ────────────────────────────────────────
+@app.post("/api/agent/chat")
+async def api_agent_chat(req: AgentChatReq):
+    """跟内嵌 agent 说一句话。阻塞的 LLM 往返扔线程池。
+    工具会在 agent 模块里就地执行（改配置/查库/导出），返回答复与操作轨迹。"""
+    if not req.messages:
+        raise HTTPException(400, "对话内容为空")
+    try:
+        return await asyncio.to_thread(agent.run_chat,
+                                       [m.model_dump() for m in req.messages], req.ui)
+    except (ValueError, RuntimeError) as e:
+        # 参数级错误 / LLM 侧失败（端点 500、超时……），原样转给人看
+        raise HTTPException(400, str(e)) from e
+    except Exception:  # noqa: BLE001
+        logger.exception("Agent 对话失败")
+        raise HTTPException(502, "Agent 服务异常，请查看后端日志") from None
+
+
+@app.get("/api/agent/export/{name}")
+def api_agent_export(name: str = Path(max_length=80)):
+    """下载 agent 导出的 JSON 文件。文件名先过正则再 safe_join，越界拒之门外。
+
+    不用 FileResponse：它按块流式发 body，在这套中间件栈下发不完整；
+    导出文件撑死几 MB，整读进内存换一个单 body 消息的 Response，稳。
+    """
+    try:
+        path = agent.export_path(name)
+    except (ValueError, security.SecurityError) as e:
+        raise HTTPException(400, str(e)) from e
+    if not path.is_file():
+        raise HTTPException(404, "导出文件不存在或已被清理")
+    try:
+        data = path.read_bytes()
+    except OSError:
+        raise HTTPException(502, "导出文件读不出来") from None
+    return Response(
+        content=data,
+        media_type="application/json",
+        headers={"Content-Disposition": f'attachment; filename="{name}"',
+                 "Cache-Control": "no-store"},
+    )
 
 
 # ── 自更新 ────────────────────────────────────────────────

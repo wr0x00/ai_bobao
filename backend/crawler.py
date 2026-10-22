@@ -14,6 +14,7 @@ import logging
 import re
 import threading
 from email.utils import parsedate_to_datetime
+from urllib.parse import urljoin, urlparse
 
 import config
 import security
@@ -39,6 +40,18 @@ _SCRIPT = re.compile(r"<(script|style)[^>]*>.*?</\1>", re.S | re.I)
 _BLOCK = re.compile(r"<(pre|code)[^>]*>(.*?)</\1>", re.S | re.I)
 _POC_HINT = ("import ", "curl ", "requests.", "get /", "post /", "payload",
              "http://", "https://", "popen", "socket", "nuclei", "${jndi", "select ")
+
+# ── HTML 列表页适配 ────────────────────────────────────────
+# 不是所有社区都提供 RSS（补天这种全站 JS 交互但列表页服务端渲染的不少见）。
+# feed 探不到时把页面当通用列表页解析：<a> 里文字像文章标题的就收。
+_ANCHOR = re.compile(r'<a\b[^>]*href=["\']([^"\']+)["\'][^>]*>(.*?)</a>', re.S | re.I)
+_EXCERPT = re.compile(r"<p\b[^>]*>(.*?)</p>", re.S | re.I)
+_DATE = re.compile(r"(\d{4}-\d{1,2}-\d{1,2})")
+# 明显不是文章的链接形状：导航、账号、资源文件
+_SKIP_PATH = re.compile(
+    r"/(login|register|signin|signup|logout|about|contact|help|search|tag|tags|"
+    r"category|user|users|people|member|topic-index|feed|rss|atom|api/|static/|"
+    r"assets/|js/|css/|download|comment|setting)", re.I)
 
 
 def _with_deadline(fn, timeout: float = DEADLINE):
@@ -116,13 +129,69 @@ def all_feeds() -> list[tuple[str, str]]:
     return feeds
 
 
+def _parse_html_list(raw: bytes, base: str, source: str) -> list[dict]:
+    """通用 HTML 列表页解析：把页面里的文章链接挖出来。
+
+    规则刻意放得宽松：标题文字 ≥8 字的站内链接都算候选，再靠
+    _SKIP_PATH 挡导航/账号页、按 URL 去重、按出现顺序（通常最新在前）。
+    摘要与日期是"顺手捡"：链接后面紧跟的 <p> 若不含链接就当摘要，
+    正文里形如 2026-10-12 的日期取第一段。解析出的正经入库判定仍交给
+    内容判层管，这里只管"这一页有哪些像文章的东西"。
+    """
+    out, seen = [], set()
+    page = raw.decode("utf-8", "replace")
+    for m in _ANCHOR.finditer(page):
+        # 标题去掉括号补充（「首页 (current)」「UNITY(4)」这类）再判长度，
+        # 排掉导航上肉眼是链接却不带信息的项
+        href = m.group(1).strip()
+        title = _TAG.sub("", m.group(2)).strip()
+        bare = re.sub(r"[（(][^）)]*[）)]", "", title).strip()
+        if len(bare) < 8 or len(title) > 160:
+            continue
+        if href.startswith(("#", "javascript:", "mailto:")):
+            continue
+        url = urljoin(base, href.split("#")[0])
+        try:
+            u = urlparse(url)
+        except ValueError:
+            continue
+        if u.scheme not in ("http", "https") or _SKIP_PATH.search(u.path):
+            continue
+        if url.rstrip("#/ ").rstrip("/") == base.rstrip("/"):
+            continue
+        if url in seen:
+            continue
+        seen.add(url)
+        # 顺手捡摘要（紧邻的 <p>）和日期（ Own 块一般在 1600 字符内），捡不到就留着空
+        tail = page[m.end(): m.end() + 1600]
+        pm = _EXCERPT.search(tail)
+        desc = _TAG.sub(" ", pm.group(1)).strip() if (pm and "<a" not in pm.group(1)) else ""
+        dm = _DATE.search(tail)
+        out.append(_mk(source, title[:120], url, desc[:500], dm.group(1) if dm else ""))
+        if len(out) >= 60:
+            break
+    return out
+
+
 def fetch_articles() -> list[dict]:
-    """聚合所有 feed，按 id 去重。永不抛异常。"""
+    """聚合所有 feed，按 id 去重。永不抛异常。
+
+    每个源先按 RSS/Atom 解析；解析不出条目（HTML 页面、纯交互站的不同
+    URL 形状）就退到 HTML 列表页适配。两种走的是同一条入库流水线。
+    """
     limit = config.get("collect", "fetch_limit")
     items = []
     for name, url in all_feeds():
         try:
-            got = _with_deadline(lambda u=url: _parse_feed(_http_get(u), name))
+            raw = _with_deadline(lambda u=url: _http_get(u))
+
+            def _extract(r=raw, n=name, u=url):
+                try:
+                    return _parse_feed(r, n)
+                except Exception:  # noqa: BLE001 —— 不是 XML 就当 HTML 列表
+                    return _parse_html_list(r, u, n)
+
+            got = _with_deadline(_extract)
             logger.info("%s → %d 篇", name, len(got))
             items.extend(got[:limit])
         except Exception as e:  # noqa: BLE001
