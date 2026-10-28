@@ -17,7 +17,7 @@
  GET  /api/vulns             漏洞列表（分页，默认一页 10 条）
  GET  /api/vulns/{vid}       漏洞详情（含 PoC 与 nuclei 模板全文）
  POST /api/vulns/purge       按 collect.keep_days 清理过期漏洞
- POST /api/vulns/recheck     复检存量：LLM 重判内容性质，删掉非漏洞、重写兜底条目
+ POST /api/vulns/recheck     复检存量：LLM 重判内容性质，删掉非漏洞和兜底条目
  GET  /api/stats             总览统计（组件分布 / 平台分布 / 几个总数）
  POST /api/collect           手动触发一轮抓取（与定时任务互斥）
  GET  /api/collect/status    抓取状态（上次/下次时间）
@@ -41,6 +41,13 @@
  GET  /api/update/check     比对本仓库 HEAD 与 GitHub 远端，只读
  POST /api/update/apply     快进到远端最新（只 --ff-only，不动本地改动）
  GET  /api/session            下发本次会话的写操作令牌
+ POST /api/agent/chat         跟内嵌 agent 对话（带 session_id 就把这一轮存进会话）
+ GET  /api/agent/sessions     会话列表（对话面板左侧栏用）
+ POST /api/agent/sessions     新建会话
+ GET  /api/agent/sessions/{sid}       读一个会话（含全部消息）
+ PUT  /api/agent/sessions/{sid}       重命名会话
+ DELETE /api/agent/sessions/{sid}     删掉会话
+ DELETE /api/agent/sessions/{sid}/messages  清空会话里的消息
 
 定时：启动 10s 后先跑一轮，之后每 collect.interval_minutes 分钟自动更新；
       每轮抓完按 collect.keep_days 清一次过期漏洞。
@@ -62,6 +69,7 @@ from pydantic import BaseModel, Field
 from starlette.middleware.trustedhost import TrustedHostMiddleware
 
 import agent
+import agent_sessions
 import config
 import crawler
 import nuclei_sync
@@ -431,9 +439,32 @@ class AgentMsg(BaseModel):
 class AgentChatReq(BaseModel):
     model_config = {"extra": "forbid"}
 
+    # 会话 id。给了就这一轮存进会话文件（历史也从服务端会话里取）；
+    # 不给就是一次性问答，历史全靠前端带过来。
+    session_id: str = Field(default="", max_length=32)
     messages: list[AgentMsg] = Field(default_factory=list, max_length=agent.HISTORY_MAX * 2)
     # 前端随消息带来的界面快照：用户停留在哪个页面/页签。只进 prompt 不落库
     ui: str = Field(default="", max_length=300)
+
+
+class AgentSessionMsg(BaseModel):
+    """往会话里塞的一条历史消息。允许带 steps（老版本浏览器里的对话轨迹）。"""
+
+    model_config = {"extra": "ignore"}
+
+    role: str = Field(pattern="^(user|assistant)$")
+    content: str = Field(default="", max_length=6000)
+    steps: list[dict] = Field(default_factory=list, max_length=20)
+
+
+class AgentSessionReq(BaseModel):
+    """新建/重命名会话。标题留空就等第一句话自动起名。"""
+
+    model_config = {"extra": "forbid"}
+
+    title: str = Field(default="", max_length=60)
+    # 只在新建时用：把老版本存在浏览器里的对话一次性搬进来
+    messages: list[AgentSessionMsg] = Field(default_factory=list, max_length=200)
 
 
 # ── 唯一入口：抓取与同步 ──────────────────────────────────
@@ -609,7 +640,7 @@ def api_purge():
 @app.post("/api/vulns/recheck")
 async def api_recheck(req: RecheckReq):
     """复检存量：让模型重判每条的内容性质，删掉赛事 WriteUp 这类技术文章，
-    把当时没生成出成稿的「（兜底）」条目重新生成一遍。
+    把当时没生成出成稿的「（兜底）」条目直接删掉。
 
     逐条调模型，跑起来慢，放线程池别把事件循环占住。跟抓取共用一把锁，
     正在抓的时候直接返回 skipped——两边都在写同一个文件库。
@@ -621,7 +652,7 @@ async def api_recheck(req: RecheckReq):
     except Exception:  # noqa: BLE001 —— 完整异常进日志，前端只看得到一句人话
         logger.exception("存量复检失败")
         return {"error": "复检失败，请查看后端日志", "scanned": 0, "removed": 0,
-                "regenerated": 0, "kept": 0, "removed_ids": [], "failed": []}
+                "kept": 0, "removed_ids": [], "failed": []}
     finally:
         _collect_lock.release()
 
@@ -924,18 +955,113 @@ def api_del_source(name: str = Path(max_length=MAX_SOURCE_LEN)):
 @app.post("/api/agent/chat")
 async def api_agent_chat(req: AgentChatReq):
     """跟内嵌 agent 说一句话。阻塞的 LLM 往返扔线程池。
-    工具会在 agent 模块里就地执行（改配置/查库/导出），返回答复与操作轨迹。"""
+    工具会在 agent 模块里就地执行（改配置/查库/导出），返回答复与操作轨迹。
+
+    带 session_id 时走会话模式：历史从服务端会话文件里取，本轮问答回写进文件，
+    刷新页面、换标签页都还在。不带 session_id 是一次性问答（老行为）。
+    """
     if not req.messages:
         raise HTTPException(400, "对话内容为空")
+
+    # 本轮用户说的话：取最后一条 user 消息
+    last_user = ""
+    for m in reversed(req.messages):
+        if m.role == "user":
+            last_user = m.content.strip()
+            break
+    if not last_user:
+        raise HTTPException(400, "最后一条必须是用户消息")
+
+    sid = ""
+    if req.session_id:
+        try:
+            sid = agent_sessions.resolve(req.session_id)
+        except ValueError as e:
+            raise HTTPException(400, str(e)) from e
+
+    if sid:
+        # 会话模式：历史以服务端文件为准，前端带来的旧消息不用
+        sess = agent_sessions.get_session(sid) or {}
+        history = [{"role": m["role"], "content": m["content"]}
+                   for m in sess.get("messages", [])
+                   if m.get("role") in ("user", "assistant") and m.get("content")]
+        history.append({"role": "user", "content": last_user})
+    else:
+        history = [m.model_dump() for m in req.messages]
+
     try:
-        return await asyncio.to_thread(agent.run_chat,
-                                       [m.model_dump() for m in req.messages], req.ui)
+        result = await asyncio.to_thread(agent.run_chat, history, req.ui)
     except (ValueError, RuntimeError) as e:
         # 参数级错误 / LLM 侧失败（端点 500、超时……），原样转给人看
         raise HTTPException(400, str(e)) from e
     except Exception:  # noqa: BLE001
         logger.exception("Agent 对话失败")
         raise HTTPException(502, "Agent 服务异常，请查看后端日志") from None
+
+    if sid:
+        agent_sessions.append_message(sid, "user", last_user)
+        agent_sessions.append_message(sid, "assistant",
+                                      result.get("reply", ""), result.get("steps"))
+        result["session_id"] = sid
+    return result
+
+
+# ── AI Agent 会话历史 ────────────────────────────────────
+@app.get("/api/agent/sessions")
+def api_agent_sessions():
+    """会话列表。左侧栏用：id、标题、时间、消息条数，不带正文。"""
+    return {"sessions": agent_sessions.list_sessions()}
+
+
+@app.post("/api/agent/sessions")
+def api_agent_session_new(req: AgentSessionReq):
+    """新建一个会话。带 messages 就是「把老对话搬进来」。"""
+    return agent_sessions.create_session(
+        req.title, [m.model_dump() for m in req.messages])
+
+
+@app.get("/api/agent/sessions/{sid}")
+def api_agent_session_get(sid: str = Path(max_length=32)):
+    """读一个会话，含全部消息。"""
+    try:
+        data = agent_sessions.get_session(sid)
+    except ValueError as e:
+        raise HTTPException(400, str(e)) from e
+    if not data:
+        raise HTTPException(404, "会话不存在")
+    return data
+
+
+@app.put("/api/agent/sessions/{sid}")
+def api_agent_session_rename(req: AgentSessionReq, sid: str = Path(max_length=32)):
+    """给会话改名。"""
+    try:
+        data = agent_sessions.rename_session(sid, req.title)
+    except ValueError as e:
+        raise HTTPException(400, str(e)) from e
+    if not data:
+        raise HTTPException(404, "会话不存在")
+    return data
+
+
+@app.delete("/api/agent/sessions/{sid}")
+def api_agent_session_del(sid: str = Path(max_length=32)):
+    """删掉整个会话。"""
+    if not agent_sessions.delete_session(sid):
+        raise HTTPException(404, "会话不存在")
+    return {"ok": True}
+
+
+@app.delete("/api/agent/sessions/{sid}/messages")
+def api_agent_session_clear(sid: str = Path(max_length=32)):
+    """清空当前会话的消息，会话本身留着。"""
+    try:
+        data = agent_sessions.clear_messages(sid)
+    except ValueError as e:
+        raise HTTPException(400, str(e)) from e
+    if not data:
+        raise HTTPException(404, "会话不存在")
+    return data
 
 
 @app.get("/api/agent/export/{name}")

@@ -158,8 +158,37 @@ export const applyUpdate = () => post('/api/update/apply')
 
 // ── AI Agent 右侧对话 ───────────────────────────────────
 // messages 只发 user/assistant 的纯文本，工具轨迹在返回的 steps 里；
-// ui 是用户当前停留的界面快照，帮 agent 理解「这一条」「当前页面」这类指代
-export const agentChat = (messages, ui = "") => post('/api/agent/chat', { messages, ui })
+// ui 是用户当前停留的界面快照，帮 agent 理解「这一条」「当前页面」这类指代。
+// 带 sessionId 时，这一轮会存进服务端的会话文件，刷新也还在。
+export const agentChat = (messages, ui = "", sessionId = '') =>
+    post('/api/agent/chat', { messages, ui, session_id: sessionId })
+
+// ── AI Agent 会话历史 ───────────────────────────────────
+// 会话列表：id / 标题 / 时间 / 消息条数
+export const listSessions = () => req('/api/agent/sessions')
+
+// 新建一个会话。带 messages 就是「把老对话搬进来」。
+export const createSession = (title = '', messages = []) =>
+    post('/api/agent/sessions', { title, messages })
+
+// 读一个会话的完整内容（含消息与工具轨迹）
+export const getSession = (sid) => req(`/api/agent/sessions/${encodeURIComponent(sid)}`)
+
+// 重命名会话
+export const renameSession = (sid, title) =>
+    req(`/api/agent/sessions/${encodeURIComponent(sid)}`, {
+        method: 'PUT',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ title }),
+    })
+
+// 删掉整个会话
+export const deleteSession = (sid) =>
+    req(`/api/agent/sessions/${encodeURIComponent(sid)}`, { method: 'DELETE' })
+
+// 清空当前会话的消息，会话本身留着
+export const clearSession = (sid) =>
+    req(`/api/agent/sessions/${encodeURIComponent(sid)}/messages`, { method: 'DELETE' })
 
 // 导出文件下载。接口要求 X-AI-BaoBao 头，裸 <a href> 带不上，走 blob。
 export async function downloadAgentExport(name) {

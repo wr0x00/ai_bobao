@@ -52,8 +52,42 @@ _LEAD_TYPE_RE = re.compile(
 # 列表缓存。_load_rows 每次要读完 200 多个 meta.json，列表页翻页和状态页轮询
 # 都靠它，短缓存能省掉大量重复 IO。写操作（save / purge）会主动失效。
 _ROW_CACHE_TTL = 10.0
-_rows_cache: dict = {"at": 0.0, "rows": []}
+_rows_cache: dict = {"at": 0.0, "rows": [], "gen": 0}
 _rows_lock = threading.Lock()
+# 读盘的单飞锁：缓存过期那一瞬间，前端首屏会同时打 stats / vulns / llm 三个接口，
+# 三个都在等同一批 meta.json。以前每个线程各自去扫盘，等于同一个盘扫 N 遍。
+_rows_load_lock = threading.Lock()
+
+# 模板库缓存。841 个 yaml 要全量解析一遍，缓存住省得每次翻模板页都重来。
+# 模板目录只在 save（写入）和 _remove_summary_tpl（删除）时变，这两处会主动失效。
+_TPL_CACHE_TTL = 30.0
+_tpl_cache: dict = {"at": 0.0, "items": []}
+_tpl_lock = threading.Lock()
+
+# YAML 解析器。PyYAML 自带 libyaml 的 C 扩展时用它，比纯 Python 的 safe_load 快 5 倍，
+# 结果完全一致；没编译 C 扩展就退回 safe_load。
+_YAML_LOADER = None
+
+
+def _yaml_loader():
+    """拿最好的那个 YAML loader：优先 CSafeLoader（libyaml），否则 safe_load。"""
+    global _YAML_LOADER
+    if _YAML_LOADER is None:
+        import yaml
+        _YAML_LOADER = getattr(yaml, "CSafeLoader", yaml.SafeLoader)
+    return _YAML_LOADER
+
+
+def _parse_yaml(text: str):
+    """解析一段 YAML。libyaml 解析不了的（极少数自定义标签）退回纯 Python 再试一次。"""
+    import yaml
+    try:
+        return yaml.load(text, Loader=_yaml_loader())
+    except Exception:  # noqa: BLE001 —— 换回 safe_load 再试，还是不行就当这条模板坏了
+        try:
+            return yaml.safe_load(text)
+        except Exception:  # noqa: BLE001
+            return None
 
 
 def is_zh_name(name: str) -> bool:
@@ -130,6 +164,41 @@ def component_of(name: str, vid: str = "") -> str:
     return head[:60] if len(head) >= 3 else ""
 
 
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 # ── 评级 ──────────────────────────────────────────────────
 # 评级三条来源，按可靠性排：AI 生成/回填时给的 level、nuclei 模板自带的
 # severity（EN→中文映射）、CVSS 分数划线。都凑不齐就"未评级"，前端给灰块。
@@ -195,6 +264,7 @@ def save(meta: dict, poc: str, poc_lang: str = "python", nuclei_yaml: str = "") 
         (d / "nuclei.yaml").write_text(nuclei_yaml, encoding="utf-8")
         NUCLEI_TPL_DIR.mkdir(parents=True, exist_ok=True)   # 汇总一份，整体可 nuclei -l 跑
         shutil.copyfile(d / "nuclei.yaml", security.safe_join(NUCLEI_TPL_DIR, f"{vid}.yaml"))
+        invalidate_templates()          # 汇总目录变了，模板库缓存要跟着失效
     _dump(d, meta)
     invalidate_rows()
     return vid
@@ -268,22 +338,38 @@ def invalidate_rows() -> None:
     """写完盘就把列表缓存丢掉。抓取任务和列表页并发是常态，不失效会看到旧数据。
 
     对外公开是因为 translate.py 也会改 meta.json，改完一样得让列表刷新。
+    gen 加一是为了告诉正在读盘的那个线程："你手上这批数据已经过期了"，
+    别再往缓存里写。
     """
     with _rows_lock:
         _rows_cache["at"] = 0.0
         _rows_cache["rows"] = []
+        _rows_cache["gen"] += 1
 
 
 def _load_rows() -> list[dict]:
-    """带 10 秒缓存的全量行。返回的是同一份 list，调用方只读不改。"""
+    """带 10 秒缓存的全量行。返回的是同一份 list，调用方只读不改。
+
+    缓存过期那一瞬间，前端首屏会同时打 stats / vulns / llm 三个接口，
+    三个都要全量行。以前各扫各的盘，等于同一个盘被扫三遍，并发反而比串行慢。
+    所以这里用 single-flight：慢的那次读盘放进 _rows_load_lock，
+    别的线程在锁上排队，拿到锁再检查一次缓存，命中就直接用。
+    """
     with _rows_lock:
         if time.monotonic() - _rows_cache["at"] <= _ROW_CACHE_TTL:
             return _rows_cache["rows"]
-    rows = _load_rows_uncached()          # 锁外读盘，慢的那部分不占着锁
-    with _rows_lock:
-        _rows_cache["rows"] = rows
-        _rows_cache["at"] = time.monotonic()
-    return rows
+        gen = _rows_cache["gen"]
+
+    with _rows_load_lock:                       # 只有一个线程进去读盘，其余在这排队
+        with _rows_lock:
+            if time.monotonic() - _rows_cache["at"] <= _ROW_CACHE_TTL:
+                return _rows_cache["rows"]      # 等锁这段时间别人已经填好了
+        rows = _load_rows_uncached()
+        with _rows_lock:
+            if _rows_cache["gen"] == gen:        # 读盘期间有人写盘了，这批数据作废
+                _rows_cache["rows"] = rows
+                _rows_cache["at"] = time.monotonic()
+        return rows
 
 
 
@@ -414,6 +500,7 @@ def _remove_summary_tpl(vid: str) -> None:
         path.unlink(missing_ok=True)
     except OSError as e:
         logger.warning("汇总模板 %s 删不掉：%s", name, e)
+    invalidate_templates()              # 汇总目录变了，模板库缓存要跟着失效
 
 
 def pending_translate_count() -> int:
@@ -422,16 +509,19 @@ def pending_translate_count() -> int:
 
 
 def list_templates() -> list[dict]:
-    """模板库列表：data/nuclei_tpl 下每个 yaml 一条（可直接 nuclei -l 跑这个目录）。"""
-    import yaml
+    """模板库列表：data/nuclei_tpl 下每个 yaml 一条（可直接 nuclei -l 跑这个目录）。
+
+    841 个模板全量解析一次要 3.4 秒，其中九成是 YAML 解析本身。这里做两件事：
+    换 libyaml（PyYAML 的 C 扩展）解析，快 5 倍；再缓存 30 秒，翻页翻页不用重算。
+    """
+    with _tpl_lock:
+        if time.monotonic() - _tpl_cache["at"] <= _TPL_CACHE_TTL:
+            return _tpl_cache["items"]
 
     out = []
     if NUCLEI_TPL_DIR.exists():
         for f in sorted(NUCLEI_TPL_DIR.glob("*.yaml")):
-            try:
-                doc = yaml.safe_load(f.read_text(encoding="utf-8", errors="replace"))
-            except Exception:  # noqa: BLE001
-                continue
+            doc = _parse_yaml(f.read_text(encoding="utf-8", errors="replace"))
             if not isinstance(doc, dict) or not doc.get("id"):
                 continue
             info = doc.get("info") or {}
@@ -440,7 +530,18 @@ def list_templates() -> list[dict]:
                         "tags": info.get("tags", ""), "file": f.name,
                         "requests": len(doc.get("http") or [])})
     out.sort(key=lambda x: (x["severity"] != "critical", x["severity"] != "high", x["id"]))
+
+    with _tpl_lock:
+        _tpl_cache["items"] = out
+        _tpl_cache["at"] = time.monotonic()
     return out
+
+
+def invalidate_templates() -> None:
+    """模板目录变了就把模板库缓存丢掉。save 写入和 _remove_summary_tpl 删除后都要调。"""
+    with _tpl_lock:
+        _tpl_cache["at"] = 0.0
+        _tpl_cache["items"] = []
 
 
 def get_vuln(vid: str) -> dict | None:
@@ -518,7 +619,7 @@ def all_metas() -> list[dict]:
 def update_meta(vid: str, patch: dict) -> bool:
     """只改 meta.json 里的几个字段，PoC 和 nuclei 模板一个字都不动。
 
-    复检补 component、重写兜底标题都走这里。别拿它做批量改写：patch 里的
+    复检补 component 走这里。别拿它做批量改写：patch 里的
     键会原样覆盖，所以调用方自己负责别把 id / poc_file 塞进去。
     """
     try:

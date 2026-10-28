@@ -401,7 +401,7 @@ async function test() {
  *
  * 早期版本只按日期和 ID 去重，技术文章（WriteUp 之类）会被当成漏洞收进来。
  * 现在改成入库前由 AI 判定，这条按钮就是拿来清理那批历史脏数据的：
- * 判定不是漏洞的直接删掉，判定是漏洞但当初是「兜底」生成的重新出一版。
+ * 判定不是漏洞的直接删掉，当初是「兜底」生成的半成品也直接删掉。
  */
 async function recheck() {
   rechecking.value = true
@@ -409,8 +409,7 @@ async function recheck() {
   error.value = ''
   try {
     const r = await recheckLibrary(0)
-    const parts = [`扫了 ${r.scanned} 条，删掉 ${r.removed} 条非漏洞内容`]
-    if (r.regenerated) parts.push(`重写 ${r.regenerated} 条`)
+    const parts = [`扫了 ${r.scanned} 条，删掉 ${r.removed} 条`]
     if (r.failed?.length) parts.push(`有 ${r.failed.length} 条没处理成`)
     recheckMsg.value = parts.join('，')
   } catch (e) {

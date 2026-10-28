@@ -206,7 +206,7 @@ RSS 源 ──► crawler ──► content_judge ──► analyzer ──► s
 | POST     | `/api/vulns/{id}/nuclei`    | 生成 nuclei 模板                  |
 | POST     | `/api/vulns/purge`          | 按 `keep_days` 清理过期条目          |
 | POST     | `/api/vulns/rate`           | 给存量条目补 AI 评级（每轮抓取也自动评 20 条）   |
-| POST     | `/api/vulns/recheck`        | 存量内容复检：非漏洞条目删除、兜底条目重写         |
+| POST     | `/api/vulns/recheck`        | 存量内容复检：非漏洞条目删除、兜底条目删除         |
 | GET      | `/api/stats`                | 库内统计（总数 / 近 7 天 / 带模板 / 已中文化） |
 | POST     | `/api/translate/backfill`   | 批量翻译（`ids` 可指定范围）             |
 | POST     | `/api/collect`              | 手动触发一轮抓取                      |

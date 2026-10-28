@@ -212,7 +212,7 @@ Each cycle syncs upstream template increments first, then runs the article pipel
 | POST | `/api/vulns/{id}/nuclei` | Generate a nuclei template |
 | POST | `/api/vulns/purge` | Purge entries older than `keep_days` |
 | POST | `/api/vulns/rate` | Backfill AI severity ratings for stored entries (also rates 20 automatically per fetch round) |
-| POST | `/api/vulns/recheck` | Re-check stored entries: drop non-vulnerabilities, rewrite fallbacks |
+| POST | `/api/vulns/recheck` | Re-check stored entries: drop non-vulnerabilities and fallback entries |
 | GET | `/api/stats` | Library statistics (total / last 7 days / with template / translated) |
 | POST | `/api/translate/backfill` | Bulk translation; pass `ids` to limit scope |
 | POST | `/api/collect` | Trigger a collection cycle |

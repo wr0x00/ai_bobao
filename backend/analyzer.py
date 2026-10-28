@@ -378,7 +378,10 @@ def recheck_library(limit: int = 0, llm=None) -> dict:
 
     干两件事：
     - 判定为非漏洞（赛事 WriteUp、教程、新闻）→ 直接删掉漏洞目录和汇总模板
-    - 判定为漏洞但标题带「（兜底）」→ 模型当时没给出成稿，重新生成一遍并覆盖
+    - 标题带「（兜底）」→ 当时模型没给出成稿，直接删掉
+
+    兜底条目不再重写：模型重写一遍还是可能失败，白花配额还留个半成品在库里。
+    现在抓取阶段就已经拒收兜底条目（见 run_collect），存量这批直接清掉。
 
     limit=0 表示全库复检；处理量按 limit 截断，够先看效果了。nuclei 模板库
     来的条目（id 以 nuclei- 开头、poc_source 为 nuclei）跳过复检——模板的
@@ -386,7 +389,7 @@ def recheck_library(limit: int = 0, llm=None) -> dict:
     """
     llm = llm or get_llm()
     metas = store.all_metas()
-    scanned = removed = regenerated = kept = 0
+    scanned = removed = kept = 0
     removed_ids, failed = [], []
     for m in metas:
         if limit and scanned >= limit:
@@ -394,6 +397,18 @@ def recheck_library(limit: int = 0, llm=None) -> dict:
         if m.get("poc_source") == "nuclei" or str(m.get("id", "")).startswith("nuclei-"):
             continue                        # 模板库条目不参与判定
         scanned += 1
+        name = str(m.get("name") or "")
+        if "（兜底）" in name:
+            # 当时模型挂了才留下的半成品，没成稿也没可信度，直接清掉。
+            # 放在判定之前：这类条目不用问模型也知道要删，省下模型配额。
+            if store.delete_vuln(m["id"]):
+                removed += 1
+                removed_ids.append(m["id"])
+                logger.info("复检删除兜底条目 %s：%s", m["id"], name)
+            else:
+                failed.append(m["id"])
+            continue
+
         # 复检时手上只有 meta，没有正文；name + summary + 原理已经够模型判断性质
         verdict = content_judge.judge(llm, m, m.get("summary", ""))
         if not verdict["is_vuln"]:
@@ -409,22 +424,6 @@ def recheck_library(limit: int = 0, llm=None) -> dict:
         if verdict["component"]:
             store.update_meta(m["id"], {"component": verdict["component"]})
 
-        name = str(m.get("name") or "")
-        if "（兜底）" in name:                # 当时模型挂了，重写一遍
-            it = {"id": m["id"], "title": name.replace("（兜底）", "").strip(),
-                  "summary": m.get("summary", ""), "refs": m.get("refs", []),
-                  "cvss": m.get("cvss"), "published": m.get("published", "")}
-            gen = llm_generate(llm, it, "", m.get("_poc_text", ""))
-            if gen.get("fallback"):
-                failed.append(m["id"])
-                continue
-            store.update_meta(m["id"], {
-                "name": gen["name"], "summary": gen["summary"],
-                "principle": gen["principle"], "attack_scope": gen["attack_scope"]})
-            store.save_poc(m["id"], gen["poc"], "python")
-            regenerated += 1
-            logger.info("复检重写 %s → %s", m["id"], gen["name"])
-            continue
         kept += 1
     return {"scanned": scanned, "removed": removed, "removed_ids": removed_ids,
-            "regenerated": regenerated, "kept": kept, "failed": failed}
+            "kept": kept, "failed": failed}

@@ -16,8 +16,11 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 import re
 import subprocess
+import threading
+import time
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
@@ -36,6 +39,13 @@ _SKIP_DIRS = ("helpers/", "workflows/", ".github/", "tests/", "testdata/",
 
 _CLONE_TIMEOUT = 600       # 首次克隆 1.5w 文件，给足
 _PULL_TIMEOUT = 300
+
+# 仓库模板数缓存。仓库里 1.4w 个 yaml，每次 status 都 rglob 一遍要 3.5 秒
+# （冷盘遍历），而前端状态页轮询得很频繁。同步后仓库文件数会变，
+# 那时由 _invalidate_template_count() 作废。
+_TPL_COUNT_TTL = 300.0
+_tpl_count_cache: dict = {"at": 0.0, "n": 0}
+_tpl_count_lock = threading.Lock()
 
 # 同步点 tag 名：浅克隆的历史会被 gc，用 tag 把上次同步到的 commit 钉住
 SYNC_TAG = "ai-bobao-sync"
@@ -131,6 +141,7 @@ def ensure_repo(ref: str) -> Path:
             if repo.exists():
                 _sh.rmtree(repo, ignore_errors=True)
             raise RuntimeError(f"克隆失败: {(r.stderr or r.stdout).strip()[:300]}")
+        _invalidate_template_count()     # 仓库刚落地，模板数缓存作废
         return repo
     # 本地有仓库，把 ref 切到配置的分支（用户改了 config.ref 时才动）
     cur = _git(["rev-parse", "--abbrev-ref", "HEAD"], repo, timeout=60).strip()
@@ -138,6 +149,7 @@ def ensure_repo(ref: str) -> Path:
         logger.info("本地分支 %s → 切换到 %s", cur, ref)
         _git(["fetch", "--depth", "1", "origin", ref], repo, timeout=_PULL_TIMEOUT)
         _git(["checkout", "FETCH_HEAD"], repo, timeout=120)
+        _invalidate_template_count()     # 换了分支，仓库内容变了
     return repo
 
 
@@ -171,6 +183,7 @@ def pull(repo: Path, ref: str, old: str = "") -> str:
         _tag(repo, old, SYNC_TAG)     # 钉住同步点，别被 shallow GC 掉
     _git(["fetch", "origin", ref], repo, timeout=_PULL_TIMEOUT)
     _git(["reset", "--hard", f"origin/{ref}"], repo, timeout=120)
+    _invalidate_template_count()     # 仓库文件变了，模板数缓存作废
     return _head_commit(repo)
 
 
@@ -332,6 +345,45 @@ def commit_state(commit: str, imported: int) -> None:
     _touch_state(commit, imported)
 
 
+def _count_yaml(root: Path) -> int:
+    """数一遍目录下所有 yaml。os.scandir 比 Path.rglob 快一倍以上（Windows 上）。"""
+    n = 0
+    stack = [str(root)]
+    while stack:
+        d = stack.pop()
+        try:
+            with os.scandir(d) as it:
+                for e in it:
+                    if e.is_dir(follow_symlinks=False):
+                        stack.append(e.path)
+                    elif e.name.endswith(".yaml"):
+                        n += 1
+        except OSError:
+            continue
+    return n
+
+
+def _invalidate_template_count() -> None:
+    """仓库内容变了（同步/克隆），模板数缓存作废。"""
+    with _tpl_count_lock:
+        _tpl_count_cache["at"] = 0.0
+        _tpl_count_cache["n"] = 0
+
+
+def _local_template_count(repo: Path) -> int:
+    """仓库里的模板数，带 5 分钟缓存。仓库没克隆过就是 0。"""
+    if not (repo / ".git").is_dir():
+        return 0
+    with _tpl_count_lock:
+        if time.monotonic() - _tpl_count_cache["at"] <= _TPL_COUNT_TTL:
+            return _tpl_count_cache["n"]
+    n = _count_yaml(repo)
+    with _tpl_count_lock:
+        _tpl_count_cache["n"] = n
+        _tpl_count_cache["at"] = time.monotonic()
+    return n
+
+
 def status() -> dict:
     """同步状态，给前端展示用。
 
@@ -345,4 +397,4 @@ def status() -> dict:
             "last_commit_short": (st.get("last_commit") or "")[:12],
             "last_sync": st.get("last_sync", ""),
             "last_imported": st.get("last_imported", 0),
-            "local_templates": sum(1 for _ in repo.rglob("*.yaml")) if (repo / ".git").is_dir() else 0}
+            "local_templates": _local_template_count(repo)}
