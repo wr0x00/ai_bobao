@@ -113,7 +113,7 @@ curl -X POST localhost:8100/api/vulns/<ID>/nuclei \
   -H 'Content-Type: application/json' -d '{"allow_write": false}'
 ```
 
-**导入** — 定时增量同步上游 nuclei-templates，也可手动触发或按条件拉取入库。模板汇总在 `data/nuclei_tpl/`，可直接 `nuclei -l` 执行。
+**自动更新nuclei模板库** — 自动定时同步上游 nuclei-templates，执行逻辑：
 
 ```bash
 curl localhost:8100/api/nuclei/sync                                  # 同步状态
@@ -121,7 +121,10 @@ curl -X POST localhost:8100/api/nuclei/sync                          # 手动触
 curl 'localhost:8100/api/nuclei/remote?limit=20&severity=critical'  # 预览，不落盘
 curl -X POST localhost:8100/api/nuclei/pull -d '{"limit": 20}'      # 拉取入库
 ```
-
+储存在 `data/nuclei_tpl/`，可直接 `nuclei -l` 执行。
+```
+nuclei -l backend/data/nuclei_tpl/ -u http://target.com
+```
 ## 接入新漏洞源
 
 ![接入新漏洞源](image2.png)
@@ -151,8 +154,58 @@ curl -X DELETE localhost:8100/api/sources/先知
 - **AI 判活不可用时**自动退化为标题关键词匹配，宁可放过也不误杀——把正常社区挡在门外的代价远高于放进一个无关站点。
 - **JS 渲染的站点**探测不到 feed（页面由脚本生成），可先在浏览器里找到它的 RSS 地址再直接填进上面的 `POST /api/sources`。
 - **平台型 API**（OSV / GitHub Advisory / NVD 这类 JSON 接口）暂未实现，扩展点见 `source_discovery.py` 末尾的 `_API_ADAPTERS`。
+## 整体架构
+```mermaid
+flowchart TB
+    U["👤 用户（浏览器）"] --> FE
 
+    subgraph FE["🖥️ 前端 Vue 3 · 端口 5173"]
+      UI["只负责显示：漏洞列表 / 详情 / 图表<br>设置页 / 右下角 AI 助手面板"]
+    end
 
+    FE -- "所有操作都发 HTTP 请求 /api/..." --> BE
+
+    subgraph BE["⚙️ 后端 FastAPI（main.py）· 端口 8100 · 全系统的大脑"]
+      direction TB
+      API["API 接口：处理前端每一个请求"]
+      AGENT["🤖 AI 助手 agent.py<br>替你查库 / 加源 / 改设置 / 导出文件"]
+      SCH["⏰ 定时闹钟：默认每 10 分钟跑一轮"]
+      CRW["🕷️ 爬虫 crawler.py：抓标题和正文"]
+    end
+
+    BE --> DTA
+    SCH --> CRW
+
+    subgraph AI["🧠 AI 层（LLM，OpenAI 兼容接口，config.yaml 里填 Key）"]
+      direction LR
+      CJ["判决：是不是漏洞情报？<br>不是 → 直接丢弃"]
+      GEN["补全：简介 / 原理 / Python PoC / 中文化"]
+      NT["生成：漏洞 → nuclei 模板"]
+    end
+
+    subgraph EXT["🌐 外部世界"]
+      direction LR
+      SRC["漏洞社区 RSS：Seebug / 先知 / Exploit-DB<br>+ 你在设置页自己加的源"]
+      GIT["GitHub 上游模板库 nuclei-templates"]
+      LLM["LLM 平台（如 gpt-4o-mini）"]
+    end
+
+    SRC --> CRW
+    CRW -->|"每篇文章都送审"| CJ
+    CJ -->|"是漏洞 → 收"| GEN
+    GEN -->|"同一篇也能转成模板"| NT
+
+    subgraph DTA["💾 数据层 backend/data/（纯文件，一条漏洞一个目录）"]
+      direction LR
+      VULN["vulns/{ID}/<br>meta.json · poc.py · nuclei.yaml"]
+      TPL["nuclei_tpl/<br>全部模板汇总"]
+    end
+
+    GEN -->|"结果写成文件"| VULN
+    NT --> TPL
+    GIT -.->|"增量同步新模板"| TPL
+    LLM -.->|"提供智能"| AI
+```
 ## 项目结构
 
 ```
