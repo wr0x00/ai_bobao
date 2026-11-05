@@ -64,24 +64,30 @@ import uvicorn
 from fastapi import FastAPI, HTTPException, Path, Query, Request
 from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import Response, JSONResponse
+from fastapi.responses import JSONResponse, Response
 from pydantic import BaseModel, Field
 from starlette.middleware.trustedhost import TrustedHostMiddleware
 
 import agent
 import agent_sessions
 import config
-import crawler
 import nuclei_sync
 import nuclei_tpl
 import security
 import source_discovery
+import source_manager
 import store
 import translate
 import updater
-from analyzer import (gen_poc, pull_templates, rate_backfill, recheck_library,
-                      run_collect, sync_templates)
-from config import NUCLEI_CACHE_DIR, NUCLEI_TPL_DIR
+from analyzer import (
+    gen_poc,
+    pull_templates,
+    rate_backfill,
+    recheck_library,
+    run_collect,
+    sync_templates,
+)
+from config import NUCLEI_CACHE_DIR
 from llm import LLM, get_llm
 from store import get_vuln, list_templates, list_vulns
 
@@ -145,7 +151,7 @@ def _is_heavy(path: str, method: str) -> bool:
 
 
 # ── 请求体校验 ────────────────────────────────────────────
-class _BodyTooLarge(Exception):
+class _BodyTooLargeError(Exception):
     """请求体超了 MAX_BODY。"""
 
 
@@ -164,7 +170,7 @@ async def _read_body(receive, max_bytes: int) -> list[dict]:
             break                       # 客户端断了，或者不是请求体消息，收工
         total += len(message.get("body", b""))
         if total > max_bytes:
-            raise _BodyTooLarge
+            raise _BodyTooLargeError
         messages.append(message)
         if not message.get("more_body", False):
             break
@@ -229,7 +235,7 @@ class ApiGuard:
         # 它会把任何读取失败都当成"body 解析不了"回 400，超限提示就丢了。
         try:
             body = await _read_body(receive, security.MAX_BODY)
-        except _BodyTooLarge:
+        except _BodyTooLargeError:
             await _reject(send, 413, f"请求体过大，上限 {security.MAX_BODY // 1024}KB")
             return
 
@@ -266,11 +272,11 @@ class RateLimit:
         ip = client[0]
 
         if _is_heavy(path, method):
-            limiter, quota = _limiter_heavy, RATE_HEAVY
+            limiter = _limiter_heavy
         elif method in ("POST", "PUT", "PATCH", "DELETE"):
-            limiter, quota = _limiter_write, RATE_WRITE
+            limiter = _limiter_write
         else:
-            limiter, quota = _limiter_read, RATE_READ
+            limiter = _limiter_read
 
         if not limiter.allow(ip):
             response = JSONResponse(
@@ -378,6 +384,10 @@ class SettingsReq(BaseModel):
         return patch
 
 
+# /api/settings/test 允许不传 body。默认值放模块级，避免在函数签名里直接调构造函数。
+_DEFAULT_SETTINGS_REQ = SettingsReq()
+
+
 class PullReq(BaseModel):
     model_config = {"extra": "forbid"}
 
@@ -478,7 +488,7 @@ def _do_sync(full: bool = False, limit: int = 0) -> dict:
         _sync_status["last_run"] = datetime.now().isoformat(timespec="seconds")
         _sync_status["last_result"] = result
         return result
-    except Exception:  # noqa: BLE001 —— 同步失败不该拖垮调度线程，记日志就够了
+    except Exception:
         logger.exception("模板同步失败")
         raise
     finally:
@@ -496,7 +506,7 @@ def _do_collect() -> dict:
         _status["last_run"] = datetime.now().isoformat(timespec="seconds")
         _status["last_result"] = result
         return result
-    except Exception:  # noqa: BLE001 —— 同上，记日志后原样抛给上层
+    except Exception:
         logger.exception("定时抓取失败")
         raise
     finally:
@@ -649,7 +659,7 @@ async def api_recheck(req: RecheckReq):
         return {"skipped": True, "reason": "已有抓取任务在运行"}
     try:
         return await asyncio.to_thread(recheck_library, req.limit)
-    except Exception:  # noqa: BLE001 —— 完整异常进日志，前端只看得到一句人话
+    except Exception:
         logger.exception("存量复检失败")
         return {"error": "复检失败，请查看后端日志", "scanned": 0, "removed": 0,
                 "kept": 0, "removed_ids": [], "failed": []}
@@ -674,7 +684,7 @@ async def api_vulns_rate():
         return {"skipped": True, "reason": "已有抓取任务在运行"}
     try:
         return {"rated": await asyncio.to_thread(rate_backfill, None, 50)}
-    except Exception:  # noqa: BLE001 —— 完整异常进日志，前端只看一句人话
+    except Exception:
         logger.exception("存量评级失败")
         return {"rated": 0, "error": "评级失败，请查看后端日志"}
     finally:
@@ -715,7 +725,7 @@ def nuclei_sync_run(req: SyncReq):
     """
     try:
         return _do_sync(full=req.full, limit=req.limit)
-    except Exception:  # noqa: BLE001
+    except Exception:
         logger.exception("手动同步模板库失败")
         return {"error": "同步失败，请查看后端日志", "imported": 0, "files": []}
 
@@ -738,7 +748,7 @@ def api_remote(
         tpls = nuclei_tpl.fetch_remote_templates(
             repo, ref=ref, limit=limit, severity=severity,
             tag=tag, cache_dir=NUCLEI_CACHE_DIR)
-    except Exception:  # noqa: BLE001
+    except Exception:
         logger.exception("拉远程模板库失败 repo=%s ref=%s", repo, ref)
         raise HTTPException(502, "远程模板库拉取失败，请查看后端日志") from None
     return {"repo": repo, "ref": ref,
@@ -753,7 +763,7 @@ async def api_pull(req: PullReq):
     try:
         return await asyncio.to_thread(
             pull_templates, req.limit, req.severity, req.tag)
-    except Exception:  # noqa: BLE001
+    except Exception:
         logger.exception("远程模板入库失败")
         raise HTTPException(502, "拉取失败，请查看后端日志") from None
 
@@ -816,7 +826,7 @@ def api_llm_status():
     if now - _pending_cache["at"] > _PENDING_TTL:
         try:
             _pending_cache["value"] = store.pending_translate_count()
-        except Exception:  # noqa: BLE001 —— 扫盘失败不该让整个状态接口挂掉
+        except Exception:
             logger.exception("统计待译数失败")
         _pending_cache["at"] = now
     llm = get_llm()
@@ -865,7 +875,7 @@ def api_save_settings(req: SettingsReq):
 
 
 @app.post("/api/settings/test")
-async def api_test_llm(req: SettingsReq = SettingsReq()):
+async def api_test_llm(req: SettingsReq = _DEFAULT_SETTINGS_REQ):
     """用表单里的值（不落盘）试连一次，验证地址/密钥/模型三项。"""
     if req.llm.base or req.llm.key or req.llm.model:
         saved = dict(config.load()["llm"])      # 拷贝，别污染进程内缓存
@@ -878,7 +888,7 @@ async def api_test_llm(req: SettingsReq = SettingsReq()):
         llm = get_llm()
     try:
         reply = await asyncio.to_thread(llm.ping)
-    except Exception:  # noqa: BLE001
+    except Exception:
         logger.exception("LLM 连通性测试失败 base=%s", llm.base)
         raise HTTPException(502, "连接失败，请查看后端日志") from None
     return {"ok": True, "reply": reply, "model": llm.model, "base": llm.base}
@@ -888,10 +898,7 @@ async def api_test_llm(req: SettingsReq = SettingsReq()):
 @app.get("/api/sources")
 def api_list_sources():
     """内置源 + 用户接入的源。内置源标 builtin，只能看不能删。"""
-    custom = config.get("sources", "custom") or []
-    return {"builtin": [{"name": n, "url": u, "builtin": True}
-                        for n, u in crawler.FEEDS],
-            "custom": [{**s, "builtin": False} for s in custom]}
+    return source_manager.list_sources()
 
 
 @app.post("/api/sources/discover")
@@ -908,47 +915,30 @@ async def api_discover_source(req: DiscoverReq):
         return await asyncio.to_thread(source_discovery.discover, target, req.llm_judge)
     except security.SecurityError as e:
         raise HTTPException(400, str(e)) from e
-    except Exception:  # noqa: BLE001
+    except Exception:
         logger.exception("源探测失败 url=%s", target)
         raise HTTPException(502, "探测失败，请查看后端日志") from None
 
 
 @app.post("/api/sources")
 def api_add_source(req: SourceReq):
-    """把探测出来的 feed 地址接入。已存在的同名源视为更新地址。"""
-    if not req.url.startswith(("http://", "https://")):
-        raise HTTPException(400, "源地址必须以 http:// 或 https:// 开头")
-    name = req.name.strip()
-    if not name:
-        raise HTTPException(400, "请填写源名称")
-    custom = list(config.get("sources", "custom") or [])
-    entry = {"name": name, "url": req.url.strip(), "enabled": req.enabled}
-    for i, s in enumerate(custom):
-        if s.get("name") == name:
-            custom[i] = entry
-            break
-    else:
-        custom.append(entry)
+    """把探测出来的 feed 地址接入。已存在的同名源视为更新地址。
+
+    增删逻辑都在 source_manager 里，这里只负责把领域错误翻成 HTTP 状态码。
+    """
     try:
-        config.update({"sources": {"custom": custom}})
-    except (ValueError, TypeError) as e:
-        raise HTTPException(400, str(e)) from e
-    return {"ok": True, "sources": custom,
-            "message": f"已接入 {name}，下一轮抓取生效"}
+        return source_manager.add_source(req.name, req.url, req.enabled)
+    except source_manager.SourceError as e:
+        raise HTTPException(e.status, e.message) from e
 
 
 @app.delete("/api/sources/{name}")
 def api_del_source(name: str = Path(max_length=MAX_SOURCE_LEN)):
     """移除用户接入的源。内置源不在这里，删不掉。"""
-    custom = list(config.get("sources", "custom") or [])
-    rest = [s for s in custom if s.get("name") != name]
-    if len(rest) == len(custom):
-        raise HTTPException(404, f"未找到源：{name}")
     try:
-        config.update({"sources": {"custom": rest}})
-    except (ValueError, TypeError) as e:
-        raise HTTPException(400, str(e)) from e
-    return {"ok": True, "sources": rest, "message": f"已移除 {name}"}
+        return source_manager.remove_source(name)
+    except source_manager.SourceError as e:
+        raise HTTPException(e.status, e.message) from e
 
 
 # ── AI Agent 对话 ────────────────────────────────────────
@@ -994,7 +984,7 @@ async def api_agent_chat(req: AgentChatReq):
     except (ValueError, RuntimeError) as e:
         # 参数级错误 / LLM 侧失败（端点 500、超时……），原样转给人看
         raise HTTPException(400, str(e)) from e
-    except Exception:  # noqa: BLE001
+    except Exception:
         logger.exception("Agent 对话失败")
         raise HTTPException(502, "Agent 服务异常，请查看后端日志") from None
 

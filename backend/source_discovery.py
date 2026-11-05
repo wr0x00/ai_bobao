@@ -33,8 +33,8 @@ _ATOM = "{http://www.w3.org/2005/Atom}"
 
 
 def _get(url: str, timeout: float = 12) -> bytes:
-    import crawler
-    return crawler._http_get(url, timeout=timeout)
+    import net
+    return net.http_get(url, timeout=timeout, max_bytes=4 * 1024 * 1024)
 
 
 def _count_entries(raw: bytes) -> tuple[int, list[str]]:
@@ -111,7 +111,7 @@ def judge(url: str, titles: list[str]) -> dict:
                 "reason": str(r.get("reason", ""))[:200],
                 "suggested_name": str(r.get("suggested_name", ""))[:30],
                 "by_llm": True}
-    except Exception as e:      # noqa: BLE001
+    except Exception:      # noqa: BLE001
         hint = ("漏洞", "CVE", "漏洞利用", "复现", "0day", "RCE", "任意文件", "权限提升",
                 "vulnerability", "exploit", "injection")
         hit = [h for h in hint if any(h.lower() in t.lower() for t in titles)]

@@ -18,7 +18,7 @@ import re
 import shutil
 import threading
 import time
-from datetime import datetime, timedelta, timezone
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 import security
@@ -101,7 +101,7 @@ def is_zh_name(name: str) -> bool:
 
 
 def _now() -> str:
-    return datetime.now(timezone.utc).isoformat(timespec="seconds")
+    return datetime.now(UTC).isoformat(timespec="seconds")
 
 
 def entry_date(meta: dict) -> tuple[str, bool]:
@@ -290,7 +290,7 @@ def _load_rows_uncached() -> list[dict]:
         if not f.is_file():
             continue
         try:
-            m = json.loads(f.read_text(encoding="utf-8"))
+            m = json.loads(_read_text(f))
         except Exception:  # noqa: BLE001 —— 单条坏文件不该让整个列表打不开
             continue
         if not isinstance(m, dict) or not m.get("id"):
@@ -397,7 +397,7 @@ def list_vulns(page: int = 1, page_size: int = 10, source: str = "", q: str = ""
         rows = [r for r in rows if r["level"] == level]
     if days and int(days) > 0:
         # updated 的日期部分是 UTC 日，与列表显示的更新日期同源，直接按字典序比较
-        cutoff = (datetime.now(timezone.utc).date()
+        cutoff = (datetime.now(UTC).date()
                   - timedelta(days=int(days) - 1)).isoformat()
         rows = [r for r in rows if r["_upd"] >= cutoff]
     total = len(rows)
@@ -436,7 +436,7 @@ def patch_meta(vid: str, updates: dict) -> bool:
     if not f or not f.is_file():
         return False
     try:
-        m = json.loads(f.read_text(encoding="utf-8"))
+        m = json.loads(_read_text(f))
     except (OSError, ValueError):
         return False
     m.update(updates)
@@ -465,7 +465,7 @@ def purge_expired(keep_days: int) -> dict:
         if not f.is_file():
             continue
         try:
-            m = json.loads(f.read_text(encoding="utf-8"))
+            m = json.loads(_read_text(f))
         except (OSError, ValueError):
             continue
         if not isinstance(m, dict) or not too_old(m, keep_days):
@@ -521,7 +521,7 @@ def list_templates() -> list[dict]:
     out = []
     if NUCLEI_TPL_DIR.exists():
         for f in sorted(NUCLEI_TPL_DIR.glob("*.yaml")):
-            doc = _parse_yaml(f.read_text(encoding="utf-8", errors="replace"))
+            doc = _parse_yaml(_read_text(f))
             if not isinstance(doc, dict) or not doc.get("id"):
                 continue
             info = doc.get("info") or {}
@@ -563,7 +563,7 @@ def get_vuln(vid: str) -> dict | None:
     if not f.is_file():
         return None
     try:
-        m = json.loads(f.read_text(encoding="utf-8"))
+        m = json.loads(_read_text(f))
     except (OSError, ValueError) as e:
         logger.warning("漏洞 %s 的 meta.json 读不出来：%s", vid, e)
         return None
@@ -606,7 +606,7 @@ def all_metas() -> list[dict]:
         if not f.is_file():
             continue
         try:
-            m = json.loads(f.read_text(encoding="utf-8"))
+            m = json.loads(_read_text(f))
         except Exception:  # noqa: BLE001 —— 单条坏文件不该让整个复检中断
             continue
         if isinstance(m, dict) and m.get("id"):
@@ -632,7 +632,7 @@ def update_meta(vid: str, patch: dict) -> bool:
     if not f.is_file():
         return False
     try:
-        m = json.loads(f.read_text(encoding="utf-8"))
+        m = json.loads(_read_text(f))
     except (OSError, ValueError):
         return False
     if not isinstance(m, dict):

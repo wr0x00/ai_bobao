@@ -1,0 +1,16 @@
+# ai_bobao 后端运行时依赖
+#
+# 全部来自 stdlib 之外的实际 import（已逐文件核对 backend/*.py）。
+# 下界按当前验证通过的版本写，锁版本交给部署环境，不在这里钉死。
+#
+# 说明：README 里曾提到 feedparser，代码里从未 import 过，已移除。
+
+fastapi>=0.141        # HTTP 框架
+starlette>=1.6        # ASGI 底座 / TrustedHostMiddleware（FastAPI 传递依赖）
+pydantic>=2.12        # 请求体校验模型
+uvicorn>=0.52         # ASGI 服务器
+PyYAML>=6.0           # 配置与 nuclei 模板解析
+
+# 仅开发/测试需要，生产部署可不装：
+#   pytest>=9.2
+#   ruff>=0.17

@@ -169,6 +169,8 @@ backend/
   crawler.py      Article crawler: RSS aggregation + body fetch + PoC extraction
   sources.py      Source aggregation: article feeds + nuclei templates
   source_discovery.py  New community onboarding: feed probing + AI vetting
+  source_manager.py  Feed source management service: list / add / remove (all through the SSRF gateway)
+  net.py          Outbound HTTP wrapper: hard deadline timeout + size cap
   analyzer.py     AI layer: enrichment, PoC generation, template sync orchestration
   content_judge.py  Content triage: let the LLM separate vulnerability intel from articles
   translate.py    Chinese localization and bulk backfill

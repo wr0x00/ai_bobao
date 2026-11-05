@@ -12,11 +12,11 @@
 import hashlib
 import logging
 import re
-import threading
 from email.utils import parsedate_to_datetime
 from urllib.parse import urljoin, urlparse
 
 import config
+import net
 import security
 
 logger = logging.getLogger("ai_bobao.crawler")
@@ -54,36 +54,6 @@ _SKIP_PATH = re.compile(
     r"assets/|js/|css/|download|comment|setting)", re.I)
 
 
-def _with_deadline(fn, timeout: float = DEADLINE):
-    result: dict = {}
-
-    def worker():
-        try:
-            result["data"] = fn()
-        except Exception as e:  # noqa: BLE001
-            result["err"] = repr(e)
-
-    t = threading.Thread(target=worker, daemon=True)
-    t.start()
-    t.join(timeout)
-    if t.is_alive():
-        raise TimeoutError(f"超过 {timeout}s 未完成")
-    if "err" in result:
-        raise RuntimeError(result["err"])
-    return result["data"]
-
-
-def _http_get(url: str, timeout: float = 20, max_bytes: int = MAX_FEED) -> bytes:
-    """取一个 URL 的内容。走安全网关，内网地址、证书问题、超大响应都会被挡下。"""
-    return security.open_url(
-        url,
-        timeout=timeout,
-        max_bytes=max_bytes,
-        headers={"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) Chrome/130.0.0.0",
-                 "Accept": "*/*"},
-    )
-
-
 def _mk(source: str, title: str, link: str, desc: str, pub: str) -> dict:
     title = _TAG.sub("", title or "").strip()
     desc = _TAG.sub(" ", desc or "").strip()
@@ -91,7 +61,7 @@ def _mk(source: str, title: str, link: str, desc: str, pub: str) -> dict:
     if pub:
         try:
             date = parsedate_to_datetime(pub).date().isoformat()
-        except Exception:
+        except (TypeError, ValueError):
             date = pub[:10]
     vid = "art-" + hashlib.md5((link or title).encode()).hexdigest()[:12]
     return {"id": vid, "title": title[:120], "source": source,
@@ -108,8 +78,8 @@ def _parse_feed(raw: bytes, source: str) -> list[dict]:
     ns = "{http://www.w3.org/2005/Atom}"
     for it in root.iter(f"{ns}entry"):  # Atom
         link = ""
-        for l in it.findall(f"{ns}link"):
-            link = l.get("href") or link
+        for lnk in it.findall(f"{ns}link"):
+            link = lnk.get("href") or link
         out.append(_mk(source, it.findtext(f"{ns}title"), link,
                        it.findtext(f"{ns}summary") or it.findtext(f"{ns}content"),
                        it.findtext(f"{ns}updated") or ""))
@@ -183,7 +153,7 @@ def fetch_articles() -> list[dict]:
     items = []
     for name, url in all_feeds():
         try:
-            raw = _with_deadline(lambda u=url: _http_get(u))
+            raw = net.with_deadline(lambda u=url: net.http_get(u, max_bytes=MAX_FEED))
 
             def _extract(r=raw, n=name, u=url):
                 try:
@@ -191,7 +161,7 @@ def fetch_articles() -> list[dict]:
                 except Exception:  # noqa: BLE001 —— 不是 XML 就当 HTML 列表
                     return _parse_html_list(r, u, n)
 
-            got = _with_deadline(_extract)
+            got = net.with_deadline(_extract)
             logger.info("%s → %d 篇", name, len(got))
             items.extend(got[:limit])
         except Exception as e:  # noqa: BLE001
@@ -213,7 +183,8 @@ def fetch_article_content(link: str) -> tuple[str, str | None]:
     if not link:
         return "", None
     try:
-        raw = _with_deadline(lambda: _http_get(link, max_bytes=MAX_ARTICLE), timeout=DEADLINE)
+        raw = net.with_deadline(
+            lambda: net.http_get(link, max_bytes=MAX_ARTICLE), timeout=DEADLINE)
     except Exception as e:  # noqa: BLE001
         logger.warning("正文抓取失败 %s：%r", link[:60], e)
         return "", None

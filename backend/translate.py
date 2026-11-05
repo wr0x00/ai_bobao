@@ -80,7 +80,7 @@ def translate_one(vid: str) -> dict:
     if not f.is_file():
         return {"ok": False, "reason": "漏洞不存在"}
     try:
-        meta = json.loads(f.read_text(encoding="utf-8"))
+        meta = json.loads(store._read_text(f))
     except (OSError, ValueError) as e:
         logger.warning("漏洞 %s 的 meta.json 读不出来：%s", vid, e)
         return {"ok": False, "reason": "漏洞信息读取失败"}
@@ -151,7 +151,7 @@ def backfill(limit: int = 20, llm=None, ids: list[str] | None = None) -> dict:
             failed.append({"id": f.parent.name, "reason": "漏洞不存在"})
             continue
         try:
-            meta = json.loads(f.read_text(encoding="utf-8"))
+            meta = json.loads(store._read_text(f))
         except (OSError, ValueError):
             failed.append({"id": f.parent.name, "reason": "漏洞信息读取失败"})
             continue

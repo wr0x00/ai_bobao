@@ -279,7 +279,7 @@ def open_url(
         raise SecurityError(f"对方返回 HTTP {e.code}") from e
     except urllib.error.URLError as e:
         raise SecurityError(f"请求失败：{e.reason}") from e
-    except (TimeoutError, socket.timeout) as e:
+    except TimeoutError as e:
         raise SecurityError(f"请求超时（{timeout}s）") from e
     except OSError as e:
         raise SecurityError(f"请求失败：{e}") from e
@@ -364,8 +364,13 @@ REF_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._/-]{0,99}$")
 
 
 def valid_repo(repo: str) -> bool:
-    """仓库名是否合法。必须是 owner/repo 两段，只允许字母数字点下划线连字符。"""
-    return bool(REPO_RE.match((repo or "").strip()))
+    """仓库名是否合法。必须是 owner/repo 两段，只允许字母数字点下划线连字符。
+
+    和 valid_ref 一样要挡掉 ".."：仓库名会被拼进 GitHub 的 API URL，
+    "../evil" 这种能改掉请求路径。
+    """
+    r = (repo or "").strip()
+    return bool(REPO_RE.match(r)) and ".." not in r
 
 
 def valid_ref(ref: str) -> bool:

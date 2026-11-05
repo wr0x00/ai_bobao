@@ -216,6 +216,8 @@ backend/
   crawler.py      漏洞文章爬虫：RSS 聚合 + 正文抓取 + PoC 提取
   sources.py      数据源聚合：文章源 + nuclei 模板源
   source_discovery.py  新社区接入：feed 地址探测 + AI 判活
+  source_manager.py  播报源管理服务：源列表 / 接入 / 移除（统一走 SSRF 网关）
+  net.py          出站 HTTP 封装：硬死线超时 + 大小上限
   analyzer.py     AI 生成层：情报补全、PoC 生成、模板同步编排
   content_judge.py  内容性质判定：让 LLM 分清漏洞情报与技术文章
   translate.py    情报中文化与批量回填

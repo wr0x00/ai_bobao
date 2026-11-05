@@ -22,8 +22,8 @@ from datetime import datetime
 from pathlib import Path
 
 import config
-import crawler
 import security
+import source_manager
 import store
 from config import DATA_DIR
 from llm import get_llm
@@ -48,44 +48,28 @@ EXPORT_KEEP = 20        # exports 目录最多留几个文件，防止聊天用�
 # 它能据此换路子重试或向用户解释。
 
 def _t_list_sources(args: dict) -> dict:
-    custom = config.get("sources", "custom") or []
-    return {"ok": True,
-            "builtin": [{"name": n, "url": u} for n, u in crawler.FEEDS],
-            "custom": [{"name": s.get("name"), "url": s.get("url"),
-                        "enabled": bool(s.get("enabled", True))} for s in custom]}
+    try:
+        return {"ok": True, **source_manager.list_sources()}
+    except Exception as e:  # noqa: BLE001
+        return {"ok": False, "error": f"读取源列表失败：{e}"}
 
 
 def _t_add_source(args: dict) -> dict:
-    name = security.clean_text(args.get("name"), 60)
-    url = security.clean_text(args.get("url"), security.MAX_URL_LEN)
-    if not name:
-        return {"ok": False, "error": "源名称不能为空"}
-    if not url.startswith(("http://", "https://")):
-        return {"ok": False, "error": "源地址必须以 http:// 或 https:// 开头"}
     try:
-        url = security.check_url(url)   # SSRF 网关：内网/云元数据地址一律不放行
-    except security.SecurityError as e:
-        return {"ok": False, "error": f"源地址被安全网关拦下：{e}"}
-    custom = list(config.get("sources", "custom") or [])
-    entry = {"name": name, "url": url, "enabled": True}
-    for i, s in enumerate(custom):
-        if s.get("name") == name:
-            custom[i] = entry   # 同名视为更新
-            break
-    else:
-        custom.append(entry)
-    config.update({"sources": {"custom": custom}})
-    return {"ok": True, "message": f"已接入源「{name}」，下一轮抓取生效"}
+        return source_manager.add_source(args.get("name", ""), args.get("url", ""))
+    except source_manager.SourceError as e:
+        return {"ok": False, "error": e.message}
+    except Exception as e:  # noqa: BLE001
+        return {"ok": False, "error": f"接入源失败：{e}"}
 
 
 def _t_remove_source(args: dict) -> dict:
-    name = security.clean_text(args.get("name"), 60)
-    custom = list(config.get("sources", "custom") or [])
-    rest = [s for s in custom if s.get("name") != name]
-    if len(rest) == len(custom):
-        return {"ok": False, "error": f"未找到自定义源「{name}」（内置源本来也删不掉）"}
-    config.update({"sources": {"custom": rest}})
-    return {"ok": True, "message": f"已移除源「{name}」"}
+    try:
+        return source_manager.remove_source(args.get("name", ""))
+    except source_manager.SourceError as e:
+        return {"ok": False, "error": e.message}
+    except Exception as e:  # noqa: BLE001
+        return {"ok": False, "error": f"移除源失败：{e}"}
 
 
 def _t_get_stats(args: dict) -> dict:
@@ -371,7 +355,7 @@ def run_chat(history: list, ui: str = "") -> dict:
             raw = llm.chat_messages(conv)
         except security.SecurityError as e:
             raise ValueError(f"LLM 端点被安全网关拦下：{e}") from e
-        except Exception as e:  # noqa: BLE001 —— 网络失败/HTTP 5xx 统一翻译给人听
+        except Exception as e:
             logger.warning("Agent LLM 调用失败：%r", e)
             raise ValueError(f"LLM 调用失败：{e}") from e
 
@@ -400,7 +384,7 @@ def run_chat(history: list, ui: str = "") -> dict:
                 result = fn(args)
             except Exception as e:  # noqa: BLE001 —— 工具永不抛异常，失败也是给模型的一手信息
                 result = {"ok": False, "error": str(e)}
-            logger.info("Agent 工具 %s(...) → %s (%.1fs)", name, result.get("ok"), 
+            logger.info("Agent 工具 %s(...) → %s (%.1fs)", name, result.get("ok"),
                         (datetime.now() - t0).total_seconds())
 
         ok = bool(result.get("ok"))

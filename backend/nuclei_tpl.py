@@ -22,20 +22,17 @@ import base64
 import hashlib
 import json
 import logging
-import os
 import re
-import threading
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
 
 import yaml
 
+import net
 import security
 
 logger = logging.getLogger("ai_bobao.nuclei_tpl")
-
-_UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) Chrome/130.0.0.0"
 
 SEVERITIES = ["info", "low", "medium", "high", "critical"]
 _CVSS_BANDS = [(9.0, "critical"), (7.0, "high"), (4.0, "medium"), (0.1, "low"), (0.0, "info")]
@@ -55,6 +52,16 @@ _WRITE_HINT = re.compile(
     r"(?i)(?:\bpost\b|\bput\b|\bpatch\b|\bdelete\b|\baction\b|/upload|/create|/add|"
     r"/new\b|/insert|/register|/signup|/login\b|/logout\b|/invite|/reset|"
     r"/admin|/import|/exec|/eval|/run\b|/generate|/send|/publish|/update|/drop)"
+)
+
+# DSL matcher 里的危险内容。nuclei 会把 dsl 交给表达式引擎求值，
+# !code / !eval 这类自定义标签、以及带执行语义的函数一旦带进模板，
+# 别人拿去跑就可能执行到代码 —— 生成器必须在落盘前拦住。
+_DSL_DANGER_RE = re.compile(
+    r"(?i)"
+    r"!(?:code|eval|dsl|helper|include|template|vars?)\b"          # nuclei 自定义标签
+    r"|\b(?:exec|eval|system|popen|subprocess|shell)\s*\("          # 带执行语义的调用
+    r"|\bos\s*\.\s*(?:system|popen|remove|rmdir|listdir|getcwd|chmod)\b"
 )
 
 # PoC 里捞探测路径：url 变量、path 拼接、requests 调用行
@@ -91,53 +98,6 @@ _EVIDENCE_RE = re.compile(
     r"""["']([0-9]{3})["']\s*==|"""
     r"""(?:status_code|status)\s*==\s*(\d{3})"""
 )
-
-
-def _with_deadline(fn, timeout: float = 30.0, retry: int = 0):
-    """硬死线包装：网络调用卡死不能拖垮流水线。retry>0 时每次尝试各给一份 timeout。"""
-    for attempt in range(retry + 1):
-        box: dict = {}
-
-        def run():
-            try:
-                box["data"] = fn()
-            except Exception as e:  # noqa: BLE001
-                box["err"] = e
-
-        t = threading.Thread(target=run, daemon=True)
-        t.start()
-        t.join(timeout)
-        if t.is_alive():
-            err: Exception = TimeoutError(f"超过 {timeout}s 未完成")
-        elif "err" in box:
-            err = box["err"]
-        else:
-            return box["data"]
-        if attempt >= retry:
-            raise err
-        logger.warning("%r，%d/%d 次重试", err, attempt + 1, retry)
-    raise RuntimeError("unreachable")
-
-
-def _http_get(url: str, timeout: float = 20.0, raw: bool = True, max_bytes: int = MAX_TPL):
-    """取一个 URL 的内容。走安全网关，内网地址和超大响应都拿不到。"""
-    body = security.open_url(
-        url,
-        timeout=timeout,
-        max_bytes=max_bytes,
-        headers={"User-Agent": _UA, "Accept": "*/*"},
-    )
-    return body if raw else body.decode("utf-8", "replace")
-
-
-def _http_json(url: str, timeout: float = 20.0, max_bytes: int = MAX_TREE) -> dict:
-    """取一个 JSON 接口。GitHub Token 存在环境变量里，设了就带上，能省不少限流配额。"""
-    token = os.getenv("GITHUB_TOKEN", "")
-    headers = {"User-Agent": _UA, "Accept": "application/vnd.github+json"}
-    if token:
-        headers["Authorization"] = f"Bearer {token}"
-    raw = security.open_url(url, timeout=timeout, max_bytes=max_bytes, headers=headers)
-    return json.loads(raw)
 
 
 def _slug(text: str, fallback: str = "ai-bobao-vuln") -> str:
@@ -238,7 +198,7 @@ def load_local_templates(root: Path, limit: int = 0, include_tests: bool = False
             continue
         try:
             doc = yaml.safe_load(f.read_text(encoding="utf-8", errors="replace"))
-        except Exception:      # 模板语法错误/自定义标签，跳过
+        except (OSError, yaml.YAMLError):   # 模板语法错误/自定义标签，跳过
             continue
         tpl = parse_template(doc, rel)
         if tpl:
@@ -263,7 +223,8 @@ def fetch_remote_index(repo: str, ref: str = "main", timeout: float = 120.0) -> 
     if not valid_ref(ref):
         raise ValueError(f"分支名不合法：{ref}")
     url = f"https://api.github.com/repos/{repo}/git/trees/{ref}?recursive=1"
-    data = _with_deadline(lambda: _http_json(url, timeout), timeout + 30, retry=2)
+    data = net.with_deadline(
+        lambda: net.github_json(url, timeout, max_bytes=MAX_TREE), timeout + 30, retry=2)
     if data.get("truncated"):
         logger.warning("文件树被 GitHub 截断，结果不完整")
     paths = []
@@ -284,11 +245,12 @@ def _fetch_text(repo: str, path: str, ref: str, timeout: float) -> str:
     if _RAW_OK:
         try:
             url = f"https://raw.githubusercontent.com/{repo}/{ref}/{path}"
-            return _with_deadline(lambda: _http_get(url, timeout).decode("utf-8", "replace"), timeout + 5)
+            return net.with_deadline(
+                lambda: net.http_get_text(url, timeout, max_bytes=MAX_TPL), timeout + 5)
         except Exception:  # noqa: BLE001
             _RAW_OK = False
     api = f"https://api.github.com/repos/{repo}/contents/{path}?ref={ref}"
-    data = _with_deadline(lambda: _http_json(api, timeout), timeout + 5)
+    data = net.with_deadline(lambda: net.github_json(api, timeout, max_bytes=MAX_TPL), timeout + 5)
     return base64.b64decode(data["content"]).decode("utf-8", "replace")
 
 
@@ -300,7 +262,7 @@ def fetch_remote_template(repo: str, path: str, ref: str = "main",
     if cache_f and cache_f.is_file():
         try:
             return json.loads(cache_f.read_text(encoding="utf-8"))
-        except Exception:
+        except (OSError, ValueError):
             pass
     doc = yaml.safe_load(_fetch_text(repo, path, ref, timeout))
     if not isinstance(doc, dict):
@@ -348,7 +310,7 @@ def fetch_remote_templates(repo: str, ref: str = "main", limit: int = 30,
             fresh = (time.time() - idx_f.stat().st_mtime) < _INDEX_TTL
             if fresh and blob.get("repo") == repo and blob.get("ref") == ref and blob.get("paths"):
                 paths = blob["paths"]
-        except Exception:
+        except (OSError, ValueError):
             paths = []
     if not paths:
         paths = fetch_remote_index(repo, ref)
@@ -524,6 +486,10 @@ def _clean_spec(spec: dict, meta: dict) -> dict:
                     d = " && ".join(str(x) for x in d if str(x).strip())
                 if not isinstance(d, str) or not d.strip():
                     continue
+                # 含 !code / !eval 这类标签的 DSL 整条丢掉 —— nuclei 会当代码跑
+                if _DSL_DANGER_RE.search(d):
+                    logger.warning("丢弃含危险标签的 DSL matcher：%s", d[:120])
+                    continue
                 m["dsl"] = d[:500]
             else:
                 continue
@@ -564,6 +530,28 @@ def spec_to_yaml(spec: dict, author: str = "ai-bobao") -> str:
     return yaml.safe_dump(doc, allow_unicode=True, sort_keys=False, width=400)
 
 
+def _dangerous_dsl(spec: dict) -> str:
+    """返回 spec 里第一处危险 DSL 片段，正常模板返回空串。
+
+    危险指含 nuclei 自定义标签（!code / !eval 等）或带执行语义的函数调用 ——
+    这类 dsl 被 nuclei 求值时可能执行到代码。
+    """
+    for req in spec.get("http") or []:
+        if not isinstance(req, dict):
+            continue
+        for mt in (req.get("matchers") or []):
+            if not isinstance(mt, dict):
+                continue
+            if str(mt.get("type", "")).lower() != "dsl":
+                continue
+            d = mt.get("dsl")
+            if isinstance(d, list):
+                d = " ".join(str(x) for x in d)
+            if isinstance(d, str) and _DSL_DANGER_RE.search(d):
+                return d[:120]
+    return ""
+
+
 def validate_yaml(text: str) -> tuple[bool, str]:
     """落盘前自检：能 load、有 id、至少一条带 matcher 的请求。"""
     try:
@@ -583,17 +571,27 @@ def validate_yaml(text: str) -> tuple[bool, str]:
     for req in http:
         if not req.get("path") or not req.get("matchers"):
             return False, "存在缺少 path 或 matchers 的请求"
+    # DSL 自查放在最后：前面的结构问题更致命，先报结构问题
+    bad = _dangerous_dsl(doc)
+    if bad:
+        return False, f"DSL 含危险内容（可能被 nuclei 当代码执行）: {bad}"
     return True, ""
 
 
 def is_write_risk(spec: dict) -> bool:
-    """模板是否含写操作（生成出来给人跑，必须标风险）。"""
+    """模板是否含风险动作（写操作，或会执行代码的 DSL）。
+
+    命中就要求显式 allow_write —— 生成出来的模板是给人拿去跑的，
+    风险必须由使用者显式承担。
+    """
     for req in spec.get("http", []):
         if req.get("method", "GET") not in ("GET", "HEAD", "OPTIONS"):
             return True
         for p in req.get("path", []):
             if _WRITE_HINT.search(str(p)):
                 return True
+    if _dangerous_dsl(spec):
+        return True
     return False
 
 

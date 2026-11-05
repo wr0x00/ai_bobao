@@ -1,0 +1,47 @@
+# ai_bobao —— 工程化配置（ruff / pytest）
+#
+# 这份文件是 P0 阶段加的"防线"：改完代码跑 ruff check + pytest，基线不回退。
+# 只有工具配置，业务代码不进这里。
+
+[tool.ruff]
+# 最低 3.11：datetime.UTC、typing 的 X | Y 写法都要 3.11+
+target-version = "py311"
+line-length = 100
+# backend/ 下是平铺模块（import security），src 指过去才能让 isort
+# 把它们当自己人，而不是第三方库排到 yaml/requests 那一坨后面。
+src = ["backend"]
+exclude = [
+    "backend/data",         # nuclei 模板库（含 .github/scripts 第三方脚本）
+    "nuclei",               # Go 子项目
+    "frontend/node_modules",
+    ".ruff_cache",
+]
+
+[tool.ruff.lint]
+select = [
+    "E4", "E7", "E9",      # pycodestyle 错误级
+    "W",                   # 空白/尾随空格
+    "F",                   # pyflakes：未用导入、未用变量、未定义名字
+    "I",                   # isort：import 排序
+    "B",                   # bugbear：可变默认参数、闭包捕获循环变量
+    "UP",                  # pyupgrade：写法现代化
+    "N",                   # pep8-naming：异常类名后缀
+    "C4",                  # 推导式写法
+    "A",                   # 内置名遮蔽
+    "RUF",                 # ruff 自带补充规则（含未生效的 noqa 检测）
+    "BLE",                 # 裸 except
+]
+ignore = [
+    "E501",                # 行长：中文注释按字符数算噪声太大，交给人工
+    "RUF001", "RUF002", "RUF003",  # 中文全角标点被误判为"奇怪字符"
+]
+
+[tool.ruff.lint.per-file-ignores]
+# 测试里故意用 try/except 兜底各种畸形输入
+"backend/tests/*" = ["BLE001"]
+
+[tool.pytest.ini_options]
+testpaths = ["backend/tests"]
+# backend/ 下是平铺模块不是包，测试要能直接 import security / store
+pythonpath = ["backend"]
+addopts = "-q --strict-markers"

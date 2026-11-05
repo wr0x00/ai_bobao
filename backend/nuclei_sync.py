@@ -17,12 +17,11 @@ from __future__ import annotations
 import json
 import logging
 import os
-import re
 import subprocess
 import threading
 import time
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from pathlib import Path
 
 import yaml
@@ -256,10 +255,6 @@ def _is_tpl(rel: str) -> bool:
     return True
 
 
-# 模板里常带的自定义 YAML 标签，safe_load 不认，直接崩
-_TAG_RE = re.compile(r"!(?:code|dsl|helper|eval)")
-
-
 def parse_tpl_file(repo: Path, rel: str):
     """读单个模板文件并抽元信息。返回 None 表示不是有效模板。"""
     f = repo / rel
@@ -269,8 +264,8 @@ def parse_tpl_file(repo: Path, rel: str):
         text = f.read_text(encoding="utf-8", errors="replace")
     except OSError:
         return None
-    # 自定义标签（!code/!dsl）只在 workflow 里出现，已在 _is_tpl 排除；
-    # 残留的未知标签在下面 load 时兜住
+    # 模板里常带的自定义 YAML 标签（!code/!dsl 等）safe_load 不认，直接抛异常；
+    # 这类标签只出现在 workflow 里，已在 _is_tpl 排除，残留的未知标签在这里兜住
     try:
         doc = yaml.safe_load(text)
     except Exception:  # noqa: BLE001
@@ -319,7 +314,7 @@ def sync(ref: str = "main", full: bool = False, limit: int = 0) -> SyncResult:
     r.changed = len(files)
     if limit and len(files) > limit:
         files = files[:limit]
-        r.message = (r.message + f"；" if r.message else "") + \
+        r.message = (r.message + "；" if r.message else "") + \
             f"本次仅处理前 {limit} 个（共 {r.changed} 个）"
     if not files:
         r.message = r.message or f"无模板变更（{new[:12]}）"
@@ -332,7 +327,7 @@ def sync(ref: str = "main", full: bool = False, limit: int = 0) -> SyncResult:
 def _touch_state(commit: str, imported: int) -> None:
     st = _state()
     st["last_commit"] = commit
-    st["last_sync"] = datetime.now(timezone.utc).isoformat(timespec="seconds")
+    st["last_sync"] = datetime.now(UTC).isoformat(timespec="seconds")
     st["last_imported"] = imported
     _save_state(st)
     # 同步点也写进 tag：state 文件可能被删/损坏，tag 才是 diff 的可靠来源
