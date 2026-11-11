@@ -8,6 +8,7 @@ import { createRouter, createWebHistory } from 'vue-router'
 import App from './App.vue'
 import ListView from './ListView.vue'
 import DetailView from './DetailView.vue'
+import EnvView from './EnvView.vue'
 import TemplatesView from './TemplatesView.vue'
 import SettingsView from './SettingsView.vue'
 
@@ -16,6 +17,7 @@ const router = createRouter({
     routes: [
         { path: '/', component: ListView }, // 漏洞列表（首页，总览面板嵌在其中）
         { path: '/vuln/:id', component: DetailView }, // 漏洞详情
+        { path: '/envs', component: EnvView }, // 本地复现环境
         { path: '/templates', component: TemplatesView }, // nuclei 模板库
         { path: '/settings', component: SettingsView }, // 设置
     ],

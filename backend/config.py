@@ -46,6 +46,13 @@ DEFAULTS: dict = {
     "sources": {
         "custom": [],                         # [{name, url, enabled}]
     },
+    # 本地复现环境：LLM 依据漏洞播报里的"影响设备与型号"去拉程序/源码/镜像，
+    # 资产全部落在这个目录下。root 留空 = 用默认的 data/lab_envs。
+    "lab": {
+        "root": "",                           # 环境资产根目录，空 = 后端 data/lab_envs
+        "docker_enabled": True,               # 允许用 docker 镜像作为复现环境
+        "timeout": 600,                       # 单次拉取/启动超时（秒）
+    },
 }
 
 # 环境变量 → 配置路径。部署环境临时覆盖用，日常在设置页改就行。
@@ -63,13 +70,18 @@ _ENV = {
     "AI_BAOBAO_NUCLEI_REPO": ("nuclei", "repo"),
     "AI_BAOBAO_NUCLEI_REF": ("nuclei", "ref"),
     "AI_BAOBAO_NUCLEI_REMOTE_LIMIT": ("nuclei", "remote_limit"),
+    "AI_BAOBAO_LAB_ROOT": ("lab", "root"),
+    "AI_BAOBAO_LAB_DOCKER": ("lab", "docker_enabled"),
+    "AI_BAOBAO_LAB_TIMEOUT": ("lab", "timeout"),
 }
 
 _INT_KEYS = {("llm", "timeout"), ("collect", "interval_minutes"),
              ("collect", "fetch_limit"), ("collect", "keep_days"),
-             ("nuclei", "remote_limit"), ("nuclei", "sync_limit")}
+             ("nuclei", "remote_limit"), ("nuclei", "sync_limit"),
+             ("lab", "timeout")}
 _BOOL_KEYS = {("nuclei", "fetch_remote"), ("nuclei", "gen_templates"),
-              ("nuclei", "sync_enabled"), ("collect", "auto_translate")}
+              ("nuclei", "sync_enabled"), ("collect", "auto_translate"),
+              ("lab", "docker_enabled")}
 
 # 写盘时固定补在文件头的说明（safe_dump 不会输出注释）
 _HEADER = (
@@ -148,6 +160,16 @@ def _validate(section: str, key: str, value):
         raise ValueError("模板库仓库名要写成 owner/repo 的形式")
     if path == ("nuclei", "ref") and not security.valid_ref(value):
         raise ValueError("模板库分支名不合法")
+    if path == ("lab", "timeout") and value > 3600:
+        raise ValueError("环境拉取超时不能超过 3600 秒")
+    if path == ("lab", "root"):
+        # 空串 = 用默认目录（data/lab_envs）。这里只做形状检查，不碰磁盘，
+        # 目录能不能建由真正落盘的时候再说。
+        value = str(value or "").strip()
+        if len(value) > 500:
+            raise ValueError("环境目录路径过长")
+        if "\x00" in value:
+            raise ValueError("环境目录路径含非法字符")
     return value
 
 

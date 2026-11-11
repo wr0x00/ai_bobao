@@ -70,7 +70,7 @@ class SyncResult:
 
 def _git(args: list[str], cwd: Path, timeout: int = _PULL_TIMEOUT) -> str:
     """跑 git。Windows 下 Git 不在系统 PATH 常见，先试 git 再试常见安装位置。"""
-    exe = _find_git()
+    exe = find_git()
     if not exe:
         raise RuntimeError("未找到 git，可执行文件未加入 PATH")
     r = subprocess.run([exe, "-C", str(cwd), *args], capture_output=True,
@@ -85,13 +85,18 @@ def run_git(args: list[str], cwd: Path, timeout: int = 120) -> str:
     return _git(list(args), cwd, timeout=timeout)
 
 
-def _find_git() -> str | None:
+def find_git() -> str | None:
+    """找 git 可执行文件。Windows 下 Git 常常不在系统 PATH 里。
+
+    lab_env 拉源码仓库也要用，一并放这里当公共函数。
+    """
     import shutil
     exe = shutil.which("git")
     if exe:
         return exe
     for p in (r"C:\Program Files\Git\cmd\git.exe",
               r"C:\Program Files\Git\bin\git.exe",
+              r"C:\Program Files\Git\mingw64\bin\git.exe",
               r"C:\Program Files (x86)\Git\cmd\git.exe"):
         if Path(p).is_file():
             return p
@@ -127,7 +132,7 @@ def ensure_repo(ref: str) -> Path:
     repo = NUCLEI_REPO_DIR
     if not (repo / ".git").is_dir():
         repo.parent.mkdir(parents=True, exist_ok=True)
-        exe = _find_git()
+        exe = find_git()
         if not exe:
             raise RuntimeError("未找到 git，无法克隆 nuclei-templates")
         logger.info("首次克隆 %s → %s（约 1.5w 文件，请稍候）", TPL_REPO_URL, repo)

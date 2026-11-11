@@ -22,7 +22,8 @@ All vulnerability data comes from public channels (forums, communities, etc.).
 - **AI content triage** — Every fetched article is classified by the LLM first: only real vulnerability intelligence is kept, while CTF write-ups, tool tutorials and industry news are dropped.
 - **Self-service onboarding** — Paste a community URL in Settings; the system probes its feeds, has the LLM confirm it is a vulnerability community, and starts crawling it once confirmed.
 - **AI enrichment** — An LLM turns raw articles into structured intelligence: name, summary, root cause and attack surface. Existing PoCs are kept verbatim; missing ones are written from the publicly disclosed exploitation logic.
-- **Built-in AI assistant** — The chat panel on the right side of the page commands the system directly: query the library, attach/remove broadcast sources, change collection settings, trigger a fetch, export entries for download. Tools execute in place, with the action trail visible (see [Built-in AI Assistant](#built-in-ai-assistant)).
+- **Built-in AI assistant** — The chat panel on the right side of the page commands the system directly: query the library, attach/remove broadcast sources, change collection settings, trigger a fetch, export entries for download, **spin up reproduction environments / fire PoCs / repair environments**. Tools execute in place, with the action trail visible (see [Built-in AI Assistant](#built-in-ai-assistant)).
+- **Local reproduction environments** — Click "Build Environment" on a vulnerability detail page and the AI plans which component and version to reproduce and where to fetch the artifact from (Docker Hub / GitHub / official release packages). **The plan is shown to you first**: building only starts after you approve it, and rejecting pauses everything. Real containers come up with automatic health checks and a directly clickable target URL; the library's PoC is fired at the target for a verdict, and if it fails to reproduce, click "Update PoC" to have the AI rewrite it from the failure output — looping until it reproduces (see [Local Reproduction Environments](#local-reproduction-environments)).
 - **Bidirectional nuclei bridge** — Recorded vulnerabilities can be exported as nuclei v3 templates, and new upstream templates can be synced in incrementally.
 - **Automatic localization** — English intelligence and template metadata are translated to Simplified Chinese, preserving CVE IDs, component names and function names.
 - **Library overview** — Horizontal bar chart of component counts and a multi-color donut of platform distribution, at a glance.
@@ -75,6 +76,8 @@ Precedence: **built-in defaults < `config.yaml` < environment variables**. Every
 | `nuclei.repo` / `nuclei.ref` | `projectdiscovery/nuclei-templates` / `main` | Upstream template repository |
 | `nuclei.sync_enabled` | `true` | Sync upstream template increments on schedule |
 | `nuclei.sync_limit` | `0` | Maximum entries per sync; `0` means unlimited |
+| `lab.root` | `backend/data/lab_envs` | Root directory for reproduction environment assets (sources, images, metadata) |
+| `lab.docker_enabled` | `true` | Allow pulling / building / running Docker reproduction environments |
 
 Every key can be overridden by an environment variable prefixed with `AI_BAOBAO_` (e.g. `AI_BAOBAO_LLM_KEY`). See `_ENV` in `backend/config.py` for the full mapping.
 
@@ -95,6 +98,10 @@ Tool whitelist (everything that can change the program lives here; every argumen
 | `update_settings` | Change collection settings: fetch interval, per-source limit, retention days, auto-translate |
 | `trigger_collect` | Trigger one background collection round (never blocks the chat) |
 | `export_vulns` | Export matching entries as a JSON file; the bubble carries a download link |
+| `list_envs` / `plan_env` / `build_env` | Reproduction environments: list / AI-plan a build / actually pull artifacts and build |
+| `start_env` / `stop_env` / `delete_env` / `get_env` | Environment ops: start/stop, tear down for a rebuild, inspect build logs and container logs (to diagnose failures) |
+| `verify_poc` | Fire the library's PoC at the target and report the reproduction verdict with evidence |
+| `regen_poc` | Rewrite the PoC from the last failed output — the `regen_poc → verify_poc` loop runs until it reproduces |
 
 ```bash
 curl -X POST localhost:8100/api/agent/chat                            # chat (heavy work, rate-limited)
@@ -110,6 +117,22 @@ Exported files land in `data/exports/`, filenames are strictly regex-checked and
 Click the "Auto Complete" button on a vulnerability detail page and a PoC is generated automatically from the recorded vulnerability description.
 
 ![Auto PoC completion](image4.png)
+
+## Local Reproduction Environments
+
+Click "Build Environment" on a vulnerability detail page and you land on `/envs`, where the system runs the **plan → approve → build → fire → fix** loop without leaving the page:
+
+1. **Plan** — The LLM reads the vulnerability record and decides which component and version to reproduce and where the artifact can be fetched from the public internet. If the artifact is unobtainable (closed-source firmware, no public download), it refuses with a reason instead of fabricating a fake environment.
+2. **Approve** — The plan shows component, version, source, image/repo, ports and the start command. You decide: "Build with this plan" starts the pull; "Reject & pause" suspends it (too large, suspicious source, or simply not wanted — your call). Re-planning is one click away.
+3. **Build** — The approved plan is executed literally: a ready-made Docker Hub image / GitHub sources (main repo + overlay repos, pinned by ref) / an official release package. For the "sources + base image" route a Dockerfile is generated and built automatically; there is no image size cap — the size is simply reported in the build log, and the approval step is the gate.
+4. **Fire** — The container starts automatically; a health check waits until the service is actually listening (ready → starting → running) before the library's PoC is fired at the target. A verdict of "reproduced" requires matching known response markers **and** the echo of a random marker; the verdict plus the full evidence output lands on the card.
+5. **Fix** — Not reproduced? Click "Update PoC": the failed output is fed back to the LLM verbatim so it takes a different angle, then the PoC is fired again automatically — looping until it reproduces. If the environment itself breaks, the AI assistant can read the build/container logs or tear it down for a rebuild.
+
+![Reproduction environment: automated build + PoC verification + update-PoC loop](image6.png)
+
+The card shows a **clickable target URL** (e.g. `http://127.0.0.1:9091`); "Preview" embeds the live site right in the card for manual verification. The AI panel pinned to the lower-left narrates every step and takes free-form commands too ("build a reproduction env for CVE-2024-xxxx", "fire the PoC", "why did it fail?").
+
+Security boundaries: **a plan is never executed without user approval**; every fetch URL passes the SSRF gateway; image names are regex-whitelisted; git/docker commands are always invoked as argument arrays without a shell; every field of the LLM's plan is normalized and validated before use; environments are fingerprint-deduplicated — one environment per component+version, shared across vulnerabilities.
 
 ## nuclei Bridge
 
@@ -165,13 +188,14 @@ Notes:
 backend/
   main.py         FastAPI entry: routes and scheduler
   config.py       Config loading / validation / atomic writes
-  agent.py        Built-in AI Agent: chat loop + tool registry (sources / query / settings / export)
+  agent.py        Built-in AI Agent: chat loop + tool registry (sources / query / settings / export / environments / PoC verification)
   crawler.py      Article crawler: RSS aggregation + body fetch + PoC extraction
   sources.py      Source aggregation: article feeds + nuclei templates
   source_discovery.py  New community onboarding: feed probing + AI vetting
   source_manager.py  Feed source management service: list / add / remove (all through the SSRF gateway)
   net.py          Outbound HTTP wrapper: hard deadline timeout + size cap
-  analyzer.py     AI layer: enrichment, PoC generation, template sync orchestration
+  analyzer.py     AI layer: enrichment, PoC generation (with failure-driven rewrites), template sync orchestration
+  lab_env.py      Local reproduction environments: AI planning → artifact fetch/build → container run → PoC verification loop
   content_judge.py  Content triage: let the LLM separate vulnerability intel from articles
   translate.py    Chinese localization and bulk backfill
   nuclei_tpl.py   PoC → nuclei template generation (structured JSON + YAML assembly)
@@ -189,6 +213,7 @@ frontend/
     OverviewPanel.vue Overview charts (component bar chart + source donut)
     TemplatesView.vue Template library
     SettingsView.vue  Online settings
+    EnvView.vue       Reproduction environments (list / target URL / site preview / update-PoC / pinned AI panel)
 ```
 
 ## Pipeline
@@ -233,6 +258,14 @@ Each cycle syncs upstream template increments first, then runs the article pipel
 | POST | `/api/sources/discover` | Probe a community's feeds and vet them with the LLM (no writes) |
 | POST | `/api/sources` | Attach or update a source |
 | DELETE | `/api/sources/{name}` | Detach a source |
+| GET | `/api/envs` | Built reproduction environments |
+| GET | `/api/envs/{eid}` | Environment detail (assets, logs, verification verdict) |
+| POST | `/api/envs/resolve` | AI-plan a reproduction environment (no writes) |
+| POST | `/api/envs/build` | Execute an approved plan: pull artifacts and build (auto-start) |
+| POST | `/api/envs/{eid}/start` | Start the environment (health-checked before "running") |
+| POST | `/api/envs/{eid}/stop` | Stop the environment |
+| POST | `/api/envs/{eid}/verify` | Fire the library's PoC at the target and record the verdict |
+| DELETE | `/api/envs/{eid}` | Delete the environment (container, image, on-disk assets) |
 
 ## Severity Rating
 

@@ -31,8 +31,17 @@
                 :title="llmOk ? '按公开思路生成 Python PoC' : '未配置 LLM 密钥，无法生成'">
           {{ busy === 'poc' ? '生成中…' : (v.poc ? '重新生成' : 'AI 生成 PoC') }}
         </button>
+        <button class="gen env" :disabled="!llmOk" @click="goBuildEnv"
+                :title="llmOk ? '按本条漏洞的影响设备与型号，自动拉取程序/源码/镜像搭出本地复现环境' : '未配置 LLM 密钥，无法规划环境'">
+          搭复现环境 →
+        </button>
       </h3>
       <p v-if="pocMsg" class="err">{{ pocMsg }}</p>
+      <p v-if="envMsg" class="envmsg">{{ envMsg }}</p>
+      <p v-if="v.env_id" class="envlink">
+        已关联复现环境 <code>{{ v.env_id }}</code>
+        <a href="#" @click.prevent="$router.push('/envs')">去环境列表 →</a>
+      </p>
       <template v-if="v.poc">
         <pre class="poc" :class="{ folded: !pocOpen }"><code v-html="pocHtml"></code></pre>
         <button class="fold" @click="pocOpen = !pocOpen">
@@ -90,6 +99,7 @@ const copied = ref('')
 const genning = ref(false)
 const genMsg = ref('')
 const pocMsg = ref('')
+const envMsg = ref('')
 const pocOpen = ref(false)       // PoC 默认折叠，长脚本一屏放不下
 const busy = ref('')            // '' | 'poc' | 'zh'，区分哪个按钮在转
 // 注意 busy 是字符串标记不是布尔，:disabled="busy" 那种写法会恒为真
@@ -232,6 +242,15 @@ async function gen() {
   }
 }
 
+/**
+ * 按本条漏洞的「影响设备与型号」自动搭本地复现环境。
+ * 搭建过程长（拉源码/构建镜像），跳到 /envs 页做：那边有固定的 AI 助手框，
+ * 实时播报搭建进度，还能对话指挥。
+ */
+function goBuildEnv() {
+  router.push(`/envs?vid=${encodeURIComponent(v.value.id)}`)
+}
+
 onMounted(() => {
   load(route.params.id)
   llmStatus().then((s) => (llmOk.value = s.available)).catch(() => (llmOk.value = false))
@@ -288,6 +307,13 @@ section p { font-size: 14px; line-height: 1.7; color: #d1d5db; }
   font-size: 12px; cursor: pointer; }
 .gen:hover { background: #38bdf8; }
 .gen:disabled { background: #374151; cursor: not-allowed; opacity: .6; }
+/* 搭环境按钮跟 AI 生成按钮区分一下色，让人一眼知道不是同一类动作 */
+.gen.env { background: #7c3aed; }
+.gen.env:hover { background: #8b5cf6; }
+.envmsg { color: #86efac; font-size: 13px; }
+.envlink { color: #8b93a1; font-size: 13px; }
+.envlink code { background: #262b36; padding: 1px 6px; border-radius: 4px; color: #7dd3fc; }
+.envlink a { color: #5aa7ff; margin-left: 8px; }
 .refs { list-style: none; font-size: 12px; color: #8b93a1; word-break: break-all; }
 .refs li { margin-bottom: 4px; }
 </style>

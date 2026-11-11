@@ -276,7 +276,10 @@ def open_url(
     except SecurityError:
         raise
     except urllib.error.HTTPError as e:
-        raise SecurityError(f"对方返回 HTTP {e.code}") from e
+        # reason 里常是关键信息：比如 301 是"重定向成死循环"、403 是"站点拦机器人"。
+        # 只报状态码的话，调用方看到"对方返回 HTTP 301"根本不知道发生了什么。
+        detail = (e.reason or "").strip()
+        raise SecurityError(f"对方返回 HTTP {e.code}" + (f"（{detail}）" if detail else "")) from e
     except urllib.error.URLError as e:
         raise SecurityError(f"请求失败：{e.reason}") from e
     except TimeoutError as e:

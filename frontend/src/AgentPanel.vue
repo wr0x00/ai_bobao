@@ -1,5 +1,5 @@
 <template>
-  <aside v-if="open" class="agwrap">
+  <aside v-if="open" class="agwrap" :class="{ cfgopen: cfgOpen }">
     <!-- 左侧：会话栏 -->
     <div class="agside">
       <div class="agsidehd">
@@ -44,6 +44,7 @@
         <b>AI 助手</b>
         <span class="hint">{{ curTitle || '加源 · 查库 · 导出 · 改设置' }}</span>
         <span class="space"></span>
+        <button class="g cfg-toggle" title="显示/隐藏参数面板" @click="cfgOpen = !cfgOpen">参数</button>
         <button class="g" :disabled="pending || !curId" @click="clearChat">清空</button>
         <button class="g" title="收起面板" @click="open = false">收起</button>
       </div>
@@ -85,6 +86,57 @@
         </button>
       </div>
     </div>
+
+    <!-- 最右：参数面板（提示词 / 上下文 / 采样 / 本次实际发送） -->
+    <div class="agcfg">
+      <div class="agcfghd">对话参数</div>
+
+      <section class="chat-sec">
+        <div class="chat-sec-t">提示词配置</div>
+        <textarea v-model="cfg.system_prompt" class="cfg-area" rows="4"
+                  placeholder="留空 = 使用内置系统提示词"></textarea>
+        <div class="cfg-hint">追加在内置提示词之后，用来补充角色、语气或额外规矩</div>
+      </section>
+
+      <section class="chat-sec">
+        <div class="chat-sec-t">上下文优化</div>
+        <label class="cfg-row">
+          <span>上下文策略</span>
+          <select v-model="cfg.context_mode">
+            <option value="drop">丢弃历史（只留本轮）</option>
+            <option value="compress">压缩早期轮次</option>
+            <option value="keep">完整保留</option>
+          </select>
+        </label>
+        <label class="cfg-row">
+          <span>保留轮数</span>
+          <input v-model.number="cfg.context_rounds" type="number" min="1" max="50" step="1" />
+        </label>
+        <label class="cfg-row">
+          <span>历史截断长度</span>
+          <input v-model.number="cfg.history_chars" type="number" min="50" max="8000" step="50" />
+        </label>
+        <div class="cfg-hint">压缩时，最近的轮次原样保留，更早的按字数截断后并成摘要</div>
+      </section>
+
+      <section class="chat-sec">
+        <div class="chat-sec-t">采样参数</div>
+        <label class="cfg-row">
+          <span>Temperature</span>
+          <input v-model.number="cfg.temperature" type="number" min="0" max="2" step="0.1" />
+        </label>
+        <label class="cfg-row">
+          <span>max_tokens</span>
+          <input v-model.number="cfg.max_tokens" type="number" min="0" max="32000" step="64" />
+        </label>
+        <div class="cfg-hint">max_tokens 填 0 表示不限制，由服务端默认</div>
+      </section>
+
+      <section class="chat-sec">
+        <div class="chat-sec-t">本次实际发送</div>
+        <pre class="chat-sent">{{ sentText }}</pre>
+      </section>
+    </div>
   </aside>
 
   <button v-else class="agfab" title="AI 助手" @click="show">AI</button>
@@ -100,7 +152,7 @@
 // 对话历史存在后端（data/sessions/<id>.json），换浏览器、刷新页面都还在。
 // 前端只记"当前是哪个会话"，会话内容每次切换时从后端拉。
 
-import { nextTick, ref, watch } from 'vue'
+import { computed, nextTick, ref, watch } from 'vue'
 import { useRoute } from 'vue-router'
 import {
     agentChat, clearSession, createSession, deleteSession, downloadAgentExport,
@@ -109,6 +161,7 @@ import {
 
 const SID_KEY = 'ai_bobao_agent_session'   // 当前会话 id
 const OLD_KEY = 'ai_bobao_agent_chat'      // 老版本存 localStorage 的对话，迁移用
+const CFG_KEY = 'ai_bobao.agent.cfg'       // 右侧参数面板的设置
 const MSG_MAX = 6000
 
 const open = ref(false)
@@ -121,8 +174,50 @@ const box = ref(null)
 const renaming = ref('')
 const renameText = ref('')
 const confirmDel = ref('')
+const cfgOpen = ref(false)                 // 窄屏下参数面板是否展开
 let renameInput = null
 let loaded = false
+
+// 参数面板的默认值：temperature 不设 = 不发给模型，max_tokens 0 = 不限制
+const DEF_CFG = {
+    system_prompt: '',
+    context_mode: 'compress',
+    context_rounds: 6,
+    history_chars: 300,
+    temperature: '',
+    max_tokens: 0,
+}
+
+/** 从 localStorage 读参数，读坏了就用默认值。 */
+function loadCfg() {
+    try {
+        const raw = localStorage.getItem(CFG_KEY)
+        if (!raw) return { ...DEF_CFG }
+        const o = JSON.parse(raw) || {}
+        return { ...DEF_CFG, ...o }
+    } catch {
+        return { ...DEF_CFG }
+    }
+}
+
+const cfg = ref(loadCfg())
+// 本轮真正发给模型的请求体（后端回带），切会话也不清空
+const sent = ref(null)
+
+/** 右下角「本次实际发送」那块显示的 JSON。 */
+const sentText = computed(() => {
+    if (!sent.value) return '（等待发送）'
+    try {
+        return JSON.stringify(sent.value, null, 2)
+    } catch {
+        return '（无法序列化）'
+    }
+})
+
+// 参数改动立刻落盘，下次打开面板还在
+watch(cfg, () => {
+    try { localStorage.setItem(CFG_KEY, JSON.stringify(cfg.value)) } catch { /* 空间满了就随缘 */ }
+}, { deep: true })
 
 const route = useRoute()
 
@@ -331,6 +426,21 @@ function onEnter() {
     draft.value = ''
 }
 
+/** 把参数面板的设置整理成后端要的形状。temperature 留空 = 不发给模型。 */
+function chatOpts() {
+    const c = cfg.value
+    const t = c.temperature === '' || c.temperature === null ? null : Number(c.temperature)
+    const mt = Number(c.max_tokens) || 0
+    return {
+        system_prompt: c.system_prompt || '',
+        context_mode: c.context_mode || 'compress',
+        context_rounds: Number(c.context_rounds) || 6,
+        history_chars: Number(c.history_chars) || 300,
+        temperature: t === null || Number.isNaN(t) ? null : t,
+        max_tokens: mt > 0 ? mt : 0,
+    }
+}
+
 /** 发一句话给 agent。历史存在后端，前端只带这一句。 */
 async function ask(text) {
     if (pending.value) return
@@ -340,12 +450,14 @@ async function ask(text) {
     msgs.value.push({ role: 'user', content: body })
     pending.value = true
     try {
-        const r = await agentChat([{ role: 'user', content: body }], uiContext(), curId.value)
+        const r = await agentChat([{ role: 'user', content: body }], uiContext(), curId.value, chatOpts())
         msgs.value.push({
             role: 'assistant',
             content: r.reply || '（空回复）',
             steps: stepsView(r.steps),
         })
+        // 后端回带这一轮真正发出去的请求体，右下角照着显示
+        if (r.sent) sent.value = r.sent
         await refreshList()
     } catch (e) {
         msgs.value.push({ role: 'fail', error: e.message })
@@ -370,7 +482,8 @@ watch(msgs, () => {
 
 <style scoped>
 .agwrap {
-  position: fixed; top: 0; right: 0; bottom: 0; width: 620px; max-width: 100vw;
+  position: fixed; top: 0; right: 0; bottom: 0;
+  width: clamp(880px, 60vw, 1160px); max-width: 100vw;
   background: #101319; border-left: 1px solid #262b36; box-shadow: -8px 0 24px rgba(0, 0, 0, .35);
   display: flex; z-index: 60;
 }
@@ -463,6 +576,41 @@ button { border: 0; border-radius: 0; cursor: pointer; font-size: 12.5px; }
          box-shadow: 0 6px 18px rgba(14, 165, 233, .4); }
 .agfab:hover { background: #38bdf8; }
 
+/* 最右参数面板：跟会话栏区分开，底色更沉、左侧带一道边 */
+.agcfg { width: 330px; flex: 0 0 330px; border-left: 1px solid #262b36;
+         background: #0d1016; overflow-y: auto; padding-bottom: 16px; }
+.agcfghd { position: sticky; top: 0; z-index: 1; padding: 12px 14px;
+           background: #0d1016; border-bottom: 1px solid #262b36;
+           color: #8b93a1; font-size: 12.5px; }
+.chat-sec { padding: 12px 14px; border-bottom: 1px solid #1a1e26; }
+.chat-sec-t { font-size: 12.5px; color: #7dd3fc; margin-bottom: 8px; }
+.cfg-row { display: flex; align-items: center; justify-content: space-between;
+           gap: 8px; font-size: 12px; color: #8b93a1; margin-bottom: 6px; }
+.cfg-row input, .cfg-row select { width: 132px; background: #0c0e12; color: #e6e6e6;
+           border: 1px solid #262b36; border-radius: 0; padding: 4px 6px;
+           font-size: 12px; font-family: inherit; outline: none; }
+.cfg-row input:focus, .cfg-row select:focus { border-color: #1e4964; }
+.cfg-area { width: 100%; background: #0c0e12; color: #e6e6e6;
+            border: 1px solid #262b36; border-radius: 0; padding: 6px 8px;
+            font-size: 12px; font-family: inherit; resize: vertical; outline: none; }
+.cfg-area:focus { border-color: #1e4964; }
+.cfg-hint { font-size: 11px; color: #6b7280; line-height: 1.6; margin-top: 4px; }
+/* 本次实际发送的 JSON：等宽字体，能滚，看得清结构 */
+.chat-sent { margin: 0; background: #0c0e12; border: 1px solid #262b36; color: #93c5fd;
+             font-family: Consolas, monospace; font-size: 11px; line-height: 1.55;
+             padding: 8px; max-height: 220px; overflow: auto; white-space: pre-wrap;
+             word-break: break-all; }
+
+/* 窄屏：参数面板改成浮层，用「参数」按钮开合 */
+.cfg-toggle { display: none; }
+@media (max-width: 1100px) {
+  .agwrap { width: 100vw; }
+  .cfg-toggle { display: inline-block; }
+  .agcfg { position: absolute; top: 0; right: 0; bottom: 0; z-index: 2;
+           box-shadow: -8px 0 24px rgba(0, 0, 0, .45); transform: translateX(100%);
+           transition: transform .18s ease; }
+  .agwrap.cfgopen .agcfg { transform: translateX(0); }
+}
 @media (max-width: 700px) {
   .agwrap { width: 100vw; }
   .agside { width: 128px; flex: 0 0 128px; }

@@ -38,6 +38,13 @@
  POST /api/sources/discover   探测社区的 feed 地址
  POST /api/sources            接入一个源
  DELETE /api/sources/{name}   移除一个源
+ GET  /api/envs               本地复现环境列表（含资产根目录）
+ GET  /api/envs/{eid}         环境详情（资产落盘位置）
+ POST /api/envs/resolve       只让 LLM 出复现方案，不拉东西
+ POST /api/envs/build         为一条漏洞搭环境（拉程序/源码/镜像，找不到就放弃）
+ POST /api/envs/{eid}/start   启动环境
+ POST /api/envs/{eid}/stop    停止环境
+ DELETE /api/envs/{eid}       删除环境
  GET  /api/update/check     比对本仓库 HEAD 与 GitHub 远端，只读
  POST /api/update/apply     快进到远端最新（只 --ff-only，不动本地改动）
  GET  /api/session            下发本次会话的写操作令牌
@@ -71,6 +78,7 @@ from starlette.middleware.trustedhost import TrustedHostMiddleware
 import agent
 import agent_sessions
 import config
+import lab_env
 import nuclei_sync
 import nuclei_tpl
 import security
@@ -128,9 +136,11 @@ _HEAVY_EXACT = frozenset({
     "/api/vulns/purge",
     "/api/vulns/rate",
     "/api/vulns/recheck",
+    "/api/envs/resolve",
+    "/api/envs/build",
 })
-_HEAVY_PREFIX = ("/api/vulns/",)     # 配合 _HEAVY_SUFFIX 用
-_HEAVY_SUFFIX = ("/nuclei", "/poc", "/translate")
+_HEAVY_PREFIX = ("/api/vulns/", "/api/envs/")     # 配合 _HEAVY_SUFFIX 用
+_HEAVY_SUFFIX = ("/nuclei", "/poc", "/translate", "/verify")
 
 _limiter_read = security.RateLimiter(RATE_READ)
 _limiter_write = security.RateLimiter(RATE_WRITE)
@@ -365,19 +375,30 @@ class NucleiSettings(BaseModel):
     sync_limit: int | None = Field(default=None, ge=0, le=MAX_SYNC_IMPORT)
 
 
+class LabSettings(BaseModel):
+    """本地复现环境参数。root 是环境资产落盘目录，空串 = 用默认目录。"""
+
+    model_config = {"extra": "forbid"}
+
+    root: str | None = Field(default=None, max_length=500)
+    docker_enabled: bool | None = None
+    timeout: int | None = Field(default=None, ge=5, le=3600)
+
+
 class SettingsReq(BaseModel):
-    """设置页整体表单。三节都可省，省掉的那节不动。"""
+    """设置页整体表单。各节都可省，省掉的那节不动。"""
 
     model_config = {"extra": "forbid"}
 
     llm: LlmSettings = Field(default_factory=LlmSettings)
     collect: CollectSettings = Field(default_factory=CollectSettings)
     nuclei: NucleiSettings = Field(default_factory=NucleiSettings)
+    lab: LabSettings = Field(default_factory=LabSettings)
 
     def to_patch(self) -> dict:
         """摊成 config.update 认识的 {节: {键: 值}}，只带走真正传了的字段。"""
         patch: dict = {}
-        for section in (self.llm, self.collect, self.nuclei):
+        for section in (self.llm, self.collect, self.nuclei, self.lab):
             given = {k: v for k, v in section.model_dump().items() if v is not None}
             if given:
                 patch[section.__class__.__name__.removesuffix("Settings").lower()] = given
@@ -437,6 +458,27 @@ class RecheckReq(BaseModel):
     limit: int = Field(default=0, ge=0, le=MAX_RECHECK)     # 0 = 全库
 
 
+class EnvReq(BaseModel):
+    """搭环境用的请求：漏洞 ID + 用户审批过的方案（可选）。
+
+    plan 是前端 resolve 出方案、用户点「按此方案搭建」后原样带回来的。
+    不带 plan 就由后端 LLM 现场规划（AI 助手对话链路走这条）。
+    """
+
+    model_config = {"extra": "forbid"}
+
+    vid: str = Field(max_length=security.MAX_VID_LEN)
+    plan: dict | None = None
+
+
+class EnvVerifyReq(BaseModel):
+    """打 PoC 验证的请求：环境 ID 在路径里，vid 可选（默认用环境关联的第一条漏洞）。"""
+
+    model_config = {"extra": "forbid"}
+
+    vid: str = Field(default="", max_length=security.MAX_VID_LEN)
+
+
 class AgentMsg(BaseModel):
     """对话消息。role 只收 user/assistant，content 长度在 agent 里二次截断。"""
 
@@ -455,6 +497,17 @@ class AgentChatReq(BaseModel):
     messages: list[AgentMsg] = Field(default_factory=list, max_length=agent.HISTORY_MAX * 2)
     # 前端随消息带来的界面快照：用户停留在哪个页面/页签。只进 prompt 不落库
     ui: str = Field(default="", max_length=300)
+    # 自定义系统提示词：留空就用内置那套
+    system_prompt: str = Field(default="", max_length=4000)
+    # 上下文优化策略：drop / compress / keep
+    context_mode: str = Field(default="compress", max_length=16)
+    # 压缩时保留最近多少轮（×2 条消息）
+    context_rounds: int = Field(default=6)
+    # 摘要里每条早期消息截断到多少字
+    history_chars: int = Field(default=300)
+    # 采样参数：None 表示不传这个字段，由模型端用默认值
+    temperature: float | None = None
+    max_tokens: int | None = None
 
 
 class AgentSessionMsg(BaseModel):
@@ -847,13 +900,14 @@ def _mask(key: str) -> str:
 def _public_settings() -> dict:
     """给前端看的配置快照。
 
-    只回白名单里的三节，sources 不回（那是另一个接口的事），config_file 只给文件名。
+    只回白名单里的几节，sources 不回（那是另一个接口的事），config_file 只给文件名。
     少回一个字段就少一条信息泄露路径，接口清单本身没必要对外。
     """
     cfg = config.load(force=True)          # 外部手改过 yaml 也能读到
     return {"llm": {**cfg["llm"], "key": _mask(cfg["llm"].get("key", ""))},
             "collect": cfg["collect"],
             "nuclei": cfg["nuclei"],
+            "lab": cfg["lab"],
             "config_file": config.CONFIG_FILE.name,
             "key_set": bool(cfg["llm"].get("key"))}
 
@@ -941,6 +995,102 @@ def api_del_source(name: str = Path(max_length=MAX_SOURCE_LEN)):
         raise HTTPException(e.status, e.message) from e
 
 
+# ── 本地复现环境 ──────────────────────────────────────────
+@app.get("/api/envs")
+def api_list_envs():
+    """环境列表。附带资产根目录和 Docker 可用性，前端顶部要显示。"""
+    return lab_env.list_envs()
+
+
+@app.get("/api/envs/{eid}")
+def api_get_env(eid: str = Path(max_length=32)):
+    """环境详情：落盘目录、程序/源码/docker 资产位置。"""
+    try:
+        return lab_env.get_env(eid)
+    except lab_env.EnvError as e:
+        raise HTTPException(e.status, e.message) from e
+
+
+@app.post("/api/envs/resolve")
+async def api_resolve_env(req: EnvReq):
+    """只让 LLM 出方案，不拉任何东西。用来先看看打算搭什么。
+
+    网上确实没有程序本体时，方案里 source=none、available=false，并带上原因。
+    """
+    try:
+        vid = security.require_vid(req.vid)
+        plan = await asyncio.to_thread(lab_env.plan_env, vid)
+    except security.SecurityError as e:
+        raise HTTPException(400, str(e)) from e
+    except lab_env.EnvError as e:
+        raise HTTPException(e.status, e.message) from e
+    return {"ok": True, "plan": plan}
+
+
+@app.post("/api/envs/build")
+async def api_build_env(req: EnvReq):
+    """为一条漏洞搭建复现环境：方案 → 真去拉 → 落盘到统一目录。
+
+    方案来源两种：req.plan 带了审批过的方案就按方案搭（不问 LLM）；
+    没带就 LLM 现场规划（AI 助手对话链路）。已有同指纹环境直接共享，
+    网上找不到程序本体就放弃，返回放弃理由。
+    """
+    try:
+        vid = security.require_vid(req.vid)
+        r = await asyncio.to_thread(lab_env.build, vid, None, req.plan)
+    except security.SecurityError as e:
+        raise HTTPException(400, str(e)) from e
+    except lab_env.EnvError as e:
+        raise HTTPException(e.status, e.message) from e
+    return r
+
+
+@app.post("/api/envs/{eid}/start")
+async def api_start_env(eid: str = Path(max_length=32)):
+    """启动环境：docker 环境起容器，源码/二进制环境起进程。"""
+    try:
+        return await asyncio.to_thread(lab_env.start_env, eid)
+    except lab_env.EnvError as e:
+        raise HTTPException(e.status, e.message) from e
+
+
+@app.post("/api/envs/{eid}/stop")
+async def api_stop_env(eid: str = Path(max_length=32)):
+    """停止环境。"""
+    try:
+        return await asyncio.to_thread(lab_env.stop_env, eid)
+    except lab_env.EnvError as e:
+        raise HTTPException(e.status, e.message) from e
+
+
+@app.post("/api/envs/{eid}/verify")
+async def api_verify_env(eid: str = Path(max_length=32), req: EnvVerifyReq | None = None):
+    """拿 PoC 真打这个环境，验证漏洞能不能复现。
+
+    req.vid 可选：不传就用环境关联的第一条漏洞。
+    环境没起来会顺手拉起来再打。
+    """
+    vid = ""
+    if req is not None and req.vid:
+        try:
+            vid = security.require_vid(req.vid)
+        except security.SecurityError as e:
+            raise HTTPException(400, str(e)) from e
+    try:
+        return await asyncio.to_thread(lab_env.verify_env, eid, vid)
+    except lab_env.EnvError as e:
+        raise HTTPException(e.status, e.message) from e
+
+
+@app.delete("/api/envs/{eid}")
+def api_delete_env(eid: str = Path(max_length=32)):
+    """删掉环境：容器、源码、程序一并清掉，引用它的漏洞也解除关联。"""
+    try:
+        return lab_env.delete_env(eid)
+    except lab_env.EnvError as e:
+        raise HTTPException(e.status, e.message) from e
+
+
 # ── AI Agent 对话 ────────────────────────────────────────
 @app.post("/api/agent/chat")
 async def api_agent_chat(req: AgentChatReq):
@@ -979,8 +1129,21 @@ async def api_agent_chat(req: AgentChatReq):
     else:
         history = [m.model_dump() for m in req.messages]
 
+    # 用户在面板右侧配的参数：越界的就地收到安全范围，认不出来的退回默认值
+    mode = req.context_mode if req.context_mode in ("drop", "compress", "keep") else "compress"
+    opts = {
+        "system_prompt": security.clean_text(req.system_prompt, 4000),
+        "context_mode": mode,
+        "context_rounds": security.clamp_int(req.context_rounds, 1, 50, 6),
+        "history_chars": security.clamp_int(req.history_chars, 50, 8000, 300),
+        "temperature": (None if req.temperature is None
+                        else max(0.0, min(2.0, req.temperature))),
+        "max_tokens": (None if not req.max_tokens or req.max_tokens <= 0
+                       else min(req.max_tokens, 32000)),
+    }
+
     try:
-        result = await asyncio.to_thread(agent.run_chat, history, req.ui)
+        result = await asyncio.to_thread(agent.run_chat, history, req.ui, opts)
     except (ValueError, RuntimeError) as e:
         # 参数级错误 / LLM 侧失败（端点 500、超时……），原样转给人看
         raise HTTPException(400, str(e)) from e

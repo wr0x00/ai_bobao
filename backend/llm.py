@@ -30,6 +30,12 @@ class LLM:
 
     def __init__(self, base: str = "", key: str = "", model: str = ""):
         self.base = (base or config.get("llm", "base")).rstrip("/")
+        # 有些服务商的页面直接给的是带 /v1 的完整地址（如
+        # https://api-inference.modelscope.cn/v1），而本类统一在末尾拼
+        # /v1/chat/completions。不归一化的话会拼出 /v1/v1/... 直接 404，
+        # 用户看起来就是"模型连接不上"。
+        if self.base.endswith("/v1"):
+            self.base = self.base[:-3]
         self.key = key or config.get("llm", "key")
         self.model = model or config.get("llm", "model")
 
@@ -63,14 +69,33 @@ class LLM:
     def chat_messages(self, messages: list[dict]) -> str:
         """多轮对话版：agent 用。整份 messages 原样发出，回原文不解析——
         agent 里的回复要么是协议 JSON、要么要当裸文本兜底，解析交给调用方。"""
+        text, _ = self.chat_messages_full(messages)
+        return text
+
+    def chat_messages_full(self, messages: list[dict],
+                           temperature: float | None = None,
+                           max_tokens: int | None = None) -> tuple[str, dict]:
+        """多轮对话版，同时回传「实际发出去的请求体」，方便前端展示。
+
+        temperature 为 None 就不带这个字段，max_tokens 不是正整数也不带，
+        跟不传时用的是模型端的同一套默认值。
+        """
         endpoint = f"{self.base}/v1/chat/completions"
         security.check_url(endpoint)
 
-        body = json.dumps({
+        payload = {
             "model": self.model,
-            "messages": messages,
+            # 复制一份列表：调用方后面还会往原 messages 里追加内容，
+            # 这里要留住"发出那一刻"的原样
+            "messages": list(messages),
             "response_format": {"type": "json_object"},
-        }).encode()
+        }
+        if temperature is not None:
+            payload["temperature"] = temperature
+        if isinstance(max_tokens, int) and max_tokens > 0:
+            payload["max_tokens"] = max_tokens
+
+        body = json.dumps(payload).encode()
         raw = security.open_url(
             endpoint,
             timeout=config.get("llm", "timeout"),
@@ -81,7 +106,7 @@ class LLM:
                      "User-Agent": _UA,
                      "Authorization": f"Bearer {self.key}"},
         )
-        return str(json.loads(raw)["choices"][0]["message"]["content"] or "")
+        return str(json.loads(raw)["choices"][0]["message"]["content"] or ""), payload
 
     def ping(self) -> str:
         """连通性自检：让模型回一个 JSON 探针，验证地址/密钥/模型三项都对。"""

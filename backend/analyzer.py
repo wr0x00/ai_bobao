@@ -108,6 +108,9 @@ _POC_SYS = (
     '{"poc": "python 代码，带注释"}。'
     "要求：TARGET 留成占位符；请求构造要与模板的 payload 逻辑一致；"
     "不得写入破坏性 payload，只做无害探测；代码要能直接运行。"
+    "若用户消息里有 last_verify_failed：说明上次按这个思路打本地复现环境没复现，"
+    "先读失败输出找原因（路径 404、参数结构不对、回显没对上等），换一种利用路径或修正"
+    "请求构造重写，别原样重复上次的写法。"
 )
 
 
@@ -127,6 +130,9 @@ def gen_poc(vid: str, llm=None) -> dict:
     brief = {"name": v.get("name", ""), "summary": v.get("summary", ""),
              "principle": v.get("principle", ""), "cvss": v.get("cvss"),
              "refs": v.get("refs", [])[:5], "nuclei_template": v.get("nuclei_yaml", "")[:4000]}
+    # 上次打靶失败的记录一起给模型：「更新 PoC 直到成功」循环里这是唯一的新信息
+    if v.get("poc_verified") == "not_reproduced" and v.get("poc_verify_note"):
+        brief["last_verify_failed"] = str(v["poc_verify_note"])[:800]
     try:
         r = llm.chat(_POC_SYS, json.dumps(brief, ensure_ascii=False))
     except Exception as e:  # noqa: BLE001

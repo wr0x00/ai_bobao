@@ -23,7 +23,8 @@ AI 赋能的漏洞播报系统，AI 根据公开的漏洞思路自动生成 PoC�
 - **自助接入新社区** — 设置页填一个社区地址，系统自动探测其 feed 并由 AI 判断是否为漏洞社区，确认后落配置即抓。
 - **AI 补全** — LLM 将文章转为结构化情报：名称、简介、原理、攻击范围；文章已含 PoC 则原样收录，缺失则按公开思路补写 Python PoC。
 - **双向 nuclei 通道** — 收录的漏洞可导出为 nuclei v3 模板；上游模板库的新增模板也可增量同步入库。
-- **内嵌 AI 助手** — 页面右侧的对话面板直接指挥系统干活：查库问数、接入/移除播报源、改采集设置、触发抓取、导出条目下载。工具就地执行，过程轨迹可见（见[内嵌 AI 助手](#内嵌-ai-助手)）。
+- **内嵌 AI 助手** — 页面右侧的对话面板直接指挥系统干活：查库问数、接入/移除播报源、改采集设置、触发抓取、导出条目下载、**搭复现环境 / 打 PoC / 修环境**。工具就地执行，过程轨迹可见（见[内嵌 AI 助手](#内嵌-ai-助手)）。
+- **本地复现环境** — 漏洞详情页点「搭复现环境」，AI 规划出要复现的组件与版本、从哪拿程序本体（Docker Hub / GitHub / 官方发布包），**方案先给用户过目**：点「按此方案搭建」才开拉，「拒绝」即暂停；起真实容器、自动健康检查、给出可直接打开的靶站地址；库里的 PoC 真打靶机给出复现结论，没复现就点「更新 PoC」让 AI 读着失败输出重写，循环到复现为止（见[本地复现环境](#本地复现环境)）。
 - **自动中文化** — 英文情报与模板元数据经 LLM 译为中文，CVE 编号、组件名、函数名保留原文。
 - **数据总览** — 组件数量横向条形图、平台分布多色环状图，一眼看清库里有什么。
 - **一键更新** — 设置页检测 GitHub 上有没有新版本，点一下快进到最新。
@@ -74,6 +75,8 @@ npm run dev        # http://localhost:5173
 | `nuclei.repo` / `nuclei.ref` | `projectdiscovery/nuclei-templates` / `main` | 上游模板库                  |
 | `nuclei.sync_enabled`        | `true`                                       | 定时任务自动同步模板库增量          |
 | `nuclei.sync_limit`          | `0`                                          | 单次同步入库上限，`0` 表示不限      |
+| `lab.root`                   | `backend/data/lab_envs`                      | 复现环境资产根目录（源码/镜像/元数据落这里）|
+| `lab.docker_enabled`         | `true`                                       | 允许拉取/构建/运行 Docker 复现环境 |
 
 所有配置项均可通过环境变量覆盖，前缀 `AI_BAOBAO_`（如 `AI_BAOBAO_LLM_KEY`），完整映射见 `backend/config.py`。
 
@@ -90,6 +93,10 @@ npm run dev        # http://localhost:5173
 | `update_settings` | 改采集设置：抓取间隔、单源上限、保留天数、自动翻译 |
 | `trigger_collect` | 触发一轮后台抓取（不阻塞对话） |
 | `export_vulns` | 按条件导出 JSON 文件，气泡里直接给下载链接 |
+| `list_envs` / `plan_env` / `build_env` | 复现环境：列环境 / AI 规划方案 / 真去拉程序本体搭起来 |
+| `start_env` / `stop_env` / `delete_env` / `get_env` | 环境操作：起停、删掉重搭、看搭建日志与容器日志（排查失败原因） |
+| `verify_poc` | 拿库里 PoC 真打靶机，输出复现结论与证据 |
+| `regen_poc` | 参考上次失败输出重写 PoC —— `regen_poc → verify_poc` 循环直到复现 |
 
 ```bash
 curl -X POST localhost:8100/api/agent/chat                          # 对话（重活限流）
@@ -103,6 +110,22 @@ curl localhost:8100/api/agent/export/vulns-20260101-120000-abcd.json  # 下载�
 点击详情页的「自动补全」按钮，即可根据漏洞描述自动生成 PoC。
 
 ![自动补全](image4.png)
+
+## 本地复现环境
+
+漏洞详情页点「搭复现环境」跳到 `/envs` 页，系统自动完成「查 → 审 → 造 → 打 → 修」闭环，全程无需离开页面：
+
+1. **查（规划）** — LLM 读漏洞情报，判断要复现哪个组件哪个版本、能从公网哪里拿到程序本体；拿不到（闭源固件、无公开下载）直接给放弃理由，不硬造假环境。
+2. **审（用户审批）** — 方案展示组件、版本、来源、镜像/仓库、端口、启动命令，用户说了算：点「按此方案搭建」才开始拉取，点「拒绝，暂停」就挂起（体积太大、来源可疑、不想搭——理由用户自己定），想重新规划随时再点「先看方案」。
+3. **造（搭建）** — 按批准的方案真去拉：Docker Hub 现成镜像 / GitHub 源码（主仓库 + 补充仓库 overlay，按 ref 精确到版本）/ 官方发布包。「源码 + 基础镜像」自建路线自动生成 Dockerfile 构建，镜像体积不设上限（方案里能看到大小，由用户审批把关）。
+4. **打（验证）** — 搭好自动起容器，健康检查确认服务真在监听（状态：就绪 → 启动中 → 运行中）后，拿库里的 PoC 真打靶机：命中回显特征 + 随机 marker 回显才算「已复现」，结论与完整证据输出落在卡片里。
+5. **修（更新 PoC 直到成功）** — 没复现？点「更新 PoC」：上次失败的输出原样喂回 LLM 换路子重写 PoC，写完自动再打一轮，循环到复现为止。环境坏了 AI 助手也能看日志、删掉重搭。
+
+![复现环境：自动搭建 + 打 PoC 验证 + 更新 PoC 闭环](image6.png)
+
+页面上直接给出**可点击的靶站地址**（如 `http://127.0.0.1:9091`），点「预览」还能在卡片里内嵌打开站点，方便手工验证。左下角的固定 AI 框实时播报每一步进度，也可以直接对话指挥（「搭 CVE-2024-xxxx 的复现环境」「打 PoC 验证」「看看为什么失败了」）。
+
+安全边界：**方案必须用户审批才开拉**；所有拉取地址过 SSRF 网关；镜像名走正则白名单；git/docker 命令一律参数数组调用不经 shell；LLM 方案逐字段收敛校验后才执行；环境指纹去重，同组件同版本只建一份、多漏洞共享。
 
 ## nuclei 双向通道
 
@@ -160,7 +183,7 @@ flowchart TB
     U["👤 用户（浏览器）"] --> FE
 
     subgraph FE["🖥️ 前端 Vue 3 · 端口 5173"]
-      UI["只负责显示：漏洞列表 / 详情 / 图表<br>设置页 / 右下角 AI 助手面板"]
+      UI["漏洞列表 / 详情 / 图表 / 设置<br>EnvView 复现环境页（靶站地址 + 站点预览 + 更新 PoC）<br>右下角 AI 助手面板 / /envs 页左下角环境 AI 框"]
     end
 
     FE -- "所有操作都发 HTTP 请求 /api/..." --> BE
@@ -168,12 +191,13 @@ flowchart TB
     subgraph BE["⚙️ 后端 FastAPI（main.py）· 端口 8100 · 全系统的大脑"]
       direction TB
       API["API 接口：处理前端每一个请求"]
-      AGENT["🤖 AI 助手 agent.py<br>替你查库 / 加源 / 改设置 / 导出文件"]
+      AGENT["🤖 AI 助手 agent.py<br>查库 / 加源 / 改设置 / 导出<br>搭环境 / 打 PoC / 修环境（工具白名单）"]
       SCH["⏰ 定时闹钟：默认每 10 分钟跑一轮"]
       CRW["🕷️ 爬虫 crawler.py：抓标题和正文"]
     end
 
     BE --> DTA
+    BE --> LAB
     SCH --> CRW
 
     subgraph AI["🧠 AI 层（LLM，OpenAI 兼容接口，config.yaml 里填 Key）"]
@@ -181,12 +205,14 @@ flowchart TB
       CJ["判决：是不是漏洞情报？<br>不是 → 直接丢弃"]
       GEN["补全：简介 / 原理 / Python PoC / 中文化"]
       NT["生成：漏洞 → nuclei 模板"]
+      REG["重写 PoC：上次失败输出喂回去<br>换路子再写（更新 PoC 循环）"]
     end
 
     subgraph EXT["🌐 外部世界"]
       direction LR
       SRC["漏洞社区 RSS：Seebug / 先知 / Exploit-DB<br>+ 你在设置页自己加的源"]
-      GIT["GitHub 上游模板库 nuclei-templates"]
+      GIT["GitHub：上游 nuclei 模板库<br>+ 组件源码仓库（可按 ref 定版本）"]
+      REGI["Docker Hub / 官方发布包"]
       LLM["LLM 平台（如 gpt-4o-mini）"]
     end
 
@@ -194,16 +220,36 @@ flowchart TB
     CRW -->|"每篇文章都送审"| CJ
     CJ -->|"是漏洞 → 收"| GEN
     GEN -->|"同一篇也能转成模板"| NT
+    subgraph LAB["🧪 本地复现环境 lab_env.py（查 + 审 + 造 + 打 + 修）"]
+      direction TB
+      PLAN["查·规划：LLM 判断复现哪个组件哪个版本<br>从哪拿程序本体；拿不到 → 放弃并给理由"]
+      APPROVE["审·用户审批：方案展示来源/镜像/端口/命令<br>「按此方案搭建」才开拉，「拒绝」即暂停"]
+      BUILD["造·搭建：docker pull / git clone / 发布包<br>源码 + 基础镜像自建，体积不设上限"]
+      RUN["运行：起容器 + 端口映射 + 健康检查<br>就绪 → 启动中 → 运行中（服务真在监听才算）"]
+      VERIFY["打·验证：执行库中 PoC 打靶机<br>回显特征 + 随机 marker → 已复现/未复现"]
+    end
+
+    PLAN -->|"用户批准后"| APPROVE
+    APPROVE -->|"按方案执行"| BUILD
+    BUILD --> RUN
+    RUN --> VERIFY
+    VERIFY -.->|"未复现：失败输出回喂"| REG
+    REG -.->|"重写 PoC 落库"| VERIFY
 
     subgraph DTA["💾 数据层 backend/data/（纯文件，一条漏洞一个目录）"]
       direction LR
-      VULN["vulns/{ID}/<br>meta.json · poc.py · nuclei.yaml"]
+      VULN["vulns/{ID}/<br>meta.json · poc.py · nuclei.yaml<br>poc_verified 复现结论回填"]
       TPL["nuclei_tpl/<br>全部模板汇总"]
+      ENVS["lab_envs/envs/{ID}/<br>环境元数据 · 源码 · 验证记录"]
     end
 
     GEN -->|"结果写成文件"| VULN
     NT --> TPL
     GIT -.->|"增量同步新模板"| TPL
+    GIT -.->|"源码拉取"| BUILD
+    REGI -.->|"镜像 / 发布包"| BUILD
+    VULN -.->|"PoC 与漏洞情报"| PLAN
+    VERIFY -->|"结论与证据落盘"| ENVS
     LLM -.->|"提供智能"| AI
 ```
 ## 项目结构
@@ -218,7 +264,8 @@ backend/
   source_discovery.py  新社区接入：feed 地址探测 + AI 判活
   source_manager.py  播报源管理服务：源列表 / 接入 / 移除（统一走 SSRF 网关）
   net.py          出站 HTTP 封装：硬死线超时 + 大小上限
-  analyzer.py     AI 生成层：情报补全、PoC 生成、模板同步编排
+  analyzer.py     AI 生成层：情报补全、PoC 生成（含失败重写）、模板同步编排
+  lab_env.py      本地复现环境：AI 规划 → 拉取/自建 → 起容器 → 打 PoC 验证闭环
   content_judge.py  内容性质判定：让 LLM 分清漏洞情报与技术文章
   translate.py    情报中文化与批量回填
   nuclei_tpl.py   PoC → nuclei 模板生成（结构化 JSON + YAML 组装）
@@ -236,6 +283,7 @@ frontend/
     OverviewPanel.vue 总览图表（组件条形图 + 来源环状图）
     TemplatesView.vue 模板库
     SettingsView.vue  在线设置
+    EnvView.vue       复现环境页（环境列表 / 靶站地址 / 站点预览 / 更新 PoC / 左下角 AI 框）
 ```
 
 ## 工作流程
@@ -280,6 +328,14 @@ RSS 源 ──► crawler ──► content_judge ──► analyzer ──► s
 | POST     | `/api/sources/discover`     | 探测社区 feed 地址并 AI 判活（不落盘）      |
 | POST     | `/api/sources`              | 接入 / 更新一个源                    |
 | DELETE   | `/api/sources/{name}`       | 移除一个源                         |
+| GET      | `/api/envs`                 | 已搭建的复现环境列表                    |
+| GET      | `/api/envs/{eid}`           | 环境详情（资源、日志、验证结论）              |
+| POST     | `/api/envs/resolve`         | AI 规划复现环境方案（不落盘）              |
+| POST     | `/api/envs/build`           | 按方案拉取程序本体并搭建（搭好自动启动）          |
+| POST     | `/api/envs/{eid}/start`     | 启动环境（健康检查通过才算运行中）             |
+| POST     | `/api/envs/{eid}/stop`      | 停止环境                          |
+| POST     | `/api/envs/{eid}/verify`    | 执行库中 PoC 打靶机，回填复现结论           |
+| DELETE   | `/api/envs/{eid}`           | 删除环境（容器/镜像/落盘目录全清）            |
 
 ## 漏洞评级
 

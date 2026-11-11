@@ -149,6 +149,30 @@ export const addSource = (s) => post('/api/sources', s)
 export const delSource = (name) =>
     req(`/api/sources/${encodeURIComponent(name)}`, { method: 'DELETE' })
 
+// ── 本地复现环境 ─────────────────────────────────────────
+// 环境列表：含资产根目录、docker 可用性
+export const listEnvs = () => req('/api/envs')
+
+export const getEnv = (id) => req(`/api/envs/${encodeURIComponent(id)}`)
+
+// 只让 LLM 出方案，不拉任何东西
+export const resolveEnv = (vid) => post('/api/envs/resolve', { vid })
+
+// 为一条漏洞搭环境：拉程序/源码/镜像，找不到就放弃。plan 是用户审批过的方案，
+// 带回来就按方案搭、不再问 LLM；不带则视为未审批（后端也会拒绝盲搭）。
+export const buildEnv = (vid, plan = null) => post('/api/envs/build', { vid, plan })
+
+export const startEnv = (id) => post(`/api/envs/${encodeURIComponent(id)}/start`)
+
+export const stopEnv = (id) => post(`/api/envs/${encodeURIComponent(id)}/stop`)
+
+// 拿库里这条漏洞的 PoC 真打这个环境，验证能不能复现
+// vid 可选：不传就用环境关联的第一条漏洞
+export const verifyEnv = (id, vid = '') => post(`/api/envs/${encodeURIComponent(id)}/verify`, vid ? { vid } : {})
+
+export const delEnv = (id) =>
+    req(`/api/envs/${encodeURIComponent(id)}`, { method: 'DELETE' })
+
 // ── 自更新 ──────────────────────────────────────────────
 // 检测更新只读：比对本地 HEAD 和 GitHub 远端分支头
 export const checkUpdate = () => req('/api/update/check')
@@ -160,8 +184,23 @@ export const applyUpdate = () => post('/api/update/apply')
 // messages 只发 user/assistant 的纯文本，工具轨迹在返回的 steps 里；
 // ui 是用户当前停留的界面快照，帮 agent 理解「这一条」「当前页面」这类指代。
 // 带 sessionId 时，这一轮会存进服务端的会话文件，刷新也还在。
-export const agentChat = (messages, ui = "", sessionId = '') =>
-    post('/api/agent/chat', { messages, ui, session_id: sessionId })
+// opts 是面板右侧配的参数：系统提示词、上下文策略、采样参数；
+// 后端会把这一轮真正发出去的请求体放在返回的 sent 里。
+export const agentChat = (messages, ui = "", sessionId = '', opts = {}) =>
+    post('/api/agent/chat', {
+        messages,
+        ui,
+        session_id: sessionId,
+        system_prompt: opts.system_prompt || '',
+        context_mode: opts.context_mode || 'compress',
+        context_rounds: opts.context_rounds === undefined ? 6 : opts.context_rounds,
+        history_chars: opts.history_chars === undefined ? 300 : opts.history_chars,
+        // 0 也要发出去（temperature=0 是合法取值），只有 undefined/null 才算"不传"
+        temperature: opts.temperature === undefined || opts.temperature === null ?
+            null : opts.temperature,
+        max_tokens: opts.max_tokens === undefined || opts.max_tokens === null ?
+            null : opts.max_tokens,
+    })
 
 // ── AI Agent 会话历史 ───────────────────────────────────
 // 会话列表：id / 标题 / 时间 / 消息条数

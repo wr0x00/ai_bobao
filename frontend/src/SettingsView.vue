@@ -139,6 +139,27 @@
     </section>
 
     <section>
+      <h3>本地复现环境<span class="tag">资产目录</span></h3>
+      <label>
+        <span>环境根目录</span>
+        <input v-model.trim="lab.root" placeholder="留空则用后端默认目录 data/lab_envs" />
+        <i>拉下来的程序、源码、docker 组件都落在这个目录下；同一个「组件+版本+来源」只存一份，多条漏洞共享</i>
+      </label>
+      <label class="check">
+        <input v-model="lab.docker_enabled" type="checkbox" />
+        <span>允许用 Docker 镜像作为复现环境</span>
+      </label>
+      <label>
+        <span>拉取超时（秒）</span>
+        <input v-model.number="lab.timeout" type="number" min="5" max="3600" />
+        <i>镜像拉取、源码 clone、固件下载都受这个超时约束</i>
+      </label>
+      <div class="acts">
+        <button class="primary" :disabled="busy" @click="save">保存全部</button>
+      </div>
+    </section>
+
+    <section>
       <h3>漏洞源管理<span class="tag">接入新社区</span></h3>
       <label>
         <span>社区地址</span>
@@ -215,6 +236,7 @@ import { safeUrl } from './safe'
 const llm = ref({ base: '', key: '', model: '', timeout: 60 })
 const collect = ref({ interval_minutes: 10, fetch_limit: 10, keep_days: 60, auto_translate: true })
 const nuclei = ref({ repo: '', ref: 'main', sync_enabled: true, sync_limit: 0, remote_limit: 20, fetch_remote: true, gen_templates: true })
+const lab = ref({ root: '', docker_enabled: true, timeout: 600 })
 const configFile = ref('')
 const keySet = ref(false)
 const busy = ref(false)
@@ -337,6 +359,7 @@ async function load() {
     llm.value = { ...s.llm, key: '' }
     collect.value = s.collect
     nuclei.value = s.nuclei
+    lab.value = { ...lab.value, ...(s.lab || {}) }
     configFile.value = s.config_file
     keySet.value = s.key_set
     keyPlaceholder.value = s.key_set ? '已配置，留空则不改动' : 'sk-...'
@@ -352,7 +375,7 @@ async function save() {
   error.value = ''
   try {
     // key 为空串时后端视为「保持原值」，所以表单里永远不塞脱敏串
-    await saveSettings({ llm: llm.value, collect: collect.value, nuclei: nuclei.value })
+    await saveSettings({ llm: llm.value, collect: collect.value, nuclei: nuclei.value, lab: lab.value })
     msg.value = '配置已写入 config.yaml'
     await load()
   } catch (e) {

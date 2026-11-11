@@ -7,6 +7,7 @@
       <span class="sub">24h 监控 · AI 筛选 · 自动生成 PoC</span>
       <nav>
         <a href="#" :class="{ on: $route.path === '/' }" @click.prevent="goList">漏洞</a>
+        <a href="#" :class="{ on: $route.path === '/envs' }" @click.prevent="$router.push('/envs')">复现环境</a>
         <a href="#" :class="{ on: $route.path === '/templates' }" @click.prevent="$router.push('/templates')">nuclei 模板库</a>
         <a href="#" :class="{ on: $route.path === '/settings' }" @click.prevent="$router.push('/settings')">设置</a>
         <!-- 仓库图标：点开 GitHub 项目页。图标自己画，不引外部图床，页面 CSP 只放行 self -->
