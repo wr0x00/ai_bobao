@@ -165,6 +165,7 @@ def _view(m: dict) -> dict:
         "cmd": str(m.get("cmd") or ""),
         "ports": list(m.get("ports") or []),
         "port_map": list(m.get("port_map") or []),
+        "size_estimate": str(m.get("size_estimate") or ""),
         "status": str(m.get("status") or STATUS_FAILED),
         "reason": str(m.get("reason") or ""),
         "vulns": list(m.get("vulns") or []),
@@ -231,6 +232,7 @@ _PLAN_SYS = (
     '"setup": ["容器内启动前要执行的准备命令，如 mkdir -p runtime"], '
     '"cmd": "容器启动命令（覆盖镜像默认 CMD），如 php -S 0.0.0.0:80 -t public public/router.php", '
     '"ports": [8080], "port_map": [{"host": 18081, "container": 80}], '
+    '"size_estimate": "预估磁盘占用：镜像约 XX MB + 源码约 XX MB，合计约 XX MB（逐项列，别拍脑袋给总数）", '
     '"available": true, '
     '"reason": "拿不到时写清原因，如闭源无公开下载、组件名无法定位"}\n'
     "铁律：\n"
@@ -243,7 +245,10 @@ _PLAN_SYS = (
     "6. overlay 是补充仓库：主仓库里缺的运行时/框架本体单独再拉一个仓库放进指定子目录。"
     "dest 写相对路径，不要写 .. 或绝对路径。\n"
     "7. port_map 写宿主机端口到容器端口的映射，host 选 1024 以上、不常用的端口；"
-    "容器端口填组件真正监听的端口。"
+    "容器端口填组件真正监听的端口。\n"
+    "8. size_estimate 是用户决定批不批的关键：按公开资料逐项估（基础镜像多大、"
+    "框架源码多大、依赖多大），给单项数字和合计；估不出来就写「约 XX，不确定」，"
+    "不许隐瞒体积或写个模糊的『不大』。"
 )
 
 
@@ -374,6 +379,7 @@ def _norm_plan(r: dict) -> dict:
         "cmd": cmd,
         "ports": ports,
         "port_map": port_map,
+        "size_estimate": str(r.get("size_estimate") or "").strip()[:300],
         "available": available,
         "reason": reason,
     }
@@ -685,6 +691,7 @@ def build(vid: str, llm=None, plan: dict | None = None) -> dict:
                 "image": "", "base_image": "", "repo": "", "ref": "",
                 "overlay": [], "release": "", "cmd": "", "setup": [],
                 "ports": plan["ports"], "port_map": plan["port_map"],
+                "size_estimate": plan.get("size_estimate", ""),
                 "status": STATUS_ABANDONED, "reason": reason,
                 # 之前失败/放弃过同一个资源就沿用那份关联，别把别的漏洞踢掉
                 "vulns": _merge_vulns(meta, vid),
@@ -707,6 +714,7 @@ def build(vid: str, llm=None, plan: dict | None = None) -> dict:
             "repo": plan["repo"], "ref": plan["ref"], "overlay": plan["overlay"],
             "release": plan["release"], "cmd": plan["cmd"], "setup": plan["setup"],
             "ports": plan["ports"], "port_map": plan["port_map"],
+            "size_estimate": plan.get("size_estimate", ""),
             "status": STATUS_BUILDING, "reason": "正在拉取程序本体/构建镜像…",
             "vulns": _merge_vulns(meta, vid),
             "created_at": (meta or {}).get("created_at") or _now(), "log": "",
@@ -729,6 +737,7 @@ def build(vid: str, llm=None, plan: dict | None = None) -> dict:
             "repo": plan["repo"], "ref": plan["ref"], "overlay": plan["overlay"],
             "release": plan["release"], "cmd": plan["cmd"], "setup": plan["setup"],
             "ports": plan["ports"], "port_map": plan["port_map"],
+            "size_estimate": plan.get("size_estimate", ""),
             "status": status,
             "reason": reason,
             "vulns": _merge_vulns(meta, vid),

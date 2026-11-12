@@ -24,7 +24,12 @@
         </a>
       </nav>
     </header>
-    <router-view />
+    <!-- EnvView 缓存常驻：切页面不打断搭建进度轮询与 AI 框播报，回来一切都在 -->
+    <router-view v-slot="{ Component }">
+      <keep-alive include="EnvView">
+        <component :is="Component" />
+      </keep-alive>
+    </router-view>
     <AgentPanel />
   </div>
 </template>

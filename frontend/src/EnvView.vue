@@ -32,6 +32,7 @@
         <div class="planrow"><span class="k">影响设备/型号</span><span>{{ plan.device || '—' }}</span></div>
         <div class="planrow"><span class="k">来源</span><span>{{ sourceText(plan.source) }}</span></div>
         <div class="planrow"><span class="k">资源</span><span class="mono">{{ plan.image || plan.repo || plan.release || '—' }}</span></div>
+        <div class="planrow"><span class="k">预估体积</span><span class="mono size">{{ plan.size_estimate || '方案里没给，谨慎起见先问一句再批' }}</span></div>
         <div class="planrow"><span class="k">启动命令</span><span class="mono">{{ plan.cmd || plan.run || '—' }}</span></div>
         <div class="planrow"><span class="k">端口</span><span>{{ (plan.ports || []).join(', ') || '—' }}</span></div>
         <div v-if="!plan.available" class="planwarn">拿不到程序本体：{{ plan.reason || '网上没有公开的可下载程序' }}</div>
@@ -148,6 +149,12 @@
 // 这里是所有漏洞验证环境的中枢：LLM 按漏洞播报里的「影响设备和型号」去全网或
 // Docker 找程序本体，找到就拉下来落到统一目录，找不到（闭源 / 没公开下载）就放弃。
 // 环境按「组件+版本+来源」算指纹，同一份程序多条漏洞共用，所以放在这一页集中管。
+//
+// 本组件被 App.vue 的 <keep-alive include="EnvView"> 缓存：切页面时组件不卸载，
+// 进度轮询和 AI 框播报照常跑，回来时方案、消息、进行中的搭建全都在。
+// keep-alive 靠组件名匹配，所以必须有 defineOptions({ name: 'EnvView' })。
+
+defineOptions({ name: 'EnvView' })
 
 import { computed, nextTick, onMounted, ref, watch } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
@@ -252,17 +259,50 @@ function openBuild() {
   error.value = ''
 }
 
+/** 把 LLM 的方案翻译成一句句人话，逐行播进 AI 框——用户不打开方案面板
+ *  也能看清 LLM 判定了什么、打算从哪拿程序本体、要占多少磁盘。 */
+function planNarrate(p) {
+  aiOpen.value = true
+  if (!p) { aiSay('ai', 'LLM 没返回有效方案。'); return }
+  const src = { docker: 'Docker Hub 现成镜像', source: 'GitHub 源码仓库',
+                release: '官方发布包直链' }[p.source] || p.source
+  const res = p.source === 'docker' ? (p.image || '（镜像名缺失）')
+    : p.source === 'release' ? (p.release || '（直链缺失）')
+    : [p.repo ? `${p.repo}${p.ref ? ' @ ' + p.ref : ''}` : '',
+       ...(p.overlay || []).map((o) =>
+         `补充仓库 ${o.repo}${o.ref ? ' @ ' + o.ref : ''} → ${o.dest}/`)].filter(Boolean).join('；') || '（仓库缺失）'
+  aiSay('ai', `LLM 规划完成：复现 ${p.component || '?'} ${p.version || ''}` +
+    (p.device ? `（影响设备：${p.device}）` : ''))
+  aiSay('ai', `程序本体来源：${src}——${res}`)
+  if (p.size_estimate) aiSay('ai', `预估磁盘占用：${p.size_estimate}`)
+  if (p.port_map && p.port_map.length) {
+    aiSay('ai', '端口映射：' + p.port_map.map((m) => `宿主机 ${m.host} → 容器 ${m.container}`).join('、'))
+  } else if (p.ports && p.ports.length) {
+    aiSay('ai', `端口：${p.ports.join('、')}`)
+  }
+  if (p.reason) aiSay('ai', `LLM 说明：${p.reason}`)
+  if (p.available) {
+    aiSay('sys', '方案已出，看上面几条就是 LLM 的判断。点「按此方案搭建」我就开拉；不放心点「拒绝，暂停」。')
+  } else {
+    aiSay('sys', 'LLM 判定拿不到程序本体，规划终止——理由在上面。可以换个漏洞试试。')
+  }
+}
+
 /** 只出方案，不拉东西。先看看 LLM 打算搭什么再决定要不要真搭。 */
 async function doResolve() {
   if (!vid.value.trim()) { error.value = '先填漏洞 ID'; return }
   busy.value = true
   error.value = ''
   msg.value = ''
+  aiOpen.value = true
+  aiSay('sys', `正在把漏洞 ${vid.value.trim()} 交给 LLM 规划复现方案（判断组件/版本、从哪拿程序本体、要占多少磁盘）…`)
   try {
     const r = await resolveEnv(vid.value.trim())
     plan.value = r.plan
+    planNarrate(r.plan)
   } catch (e) {
     error.value = e.message
+    aiSay('sys', `规划失败：${e.message}`)
   } finally {
     busy.value = false
   }
@@ -501,7 +541,8 @@ function autoBuildFromQuery() {
   doResolve().then(() => {
     if (plan.value && plan.value.available) {
       aiSay('sys', `方案已出（${plan.value.component || ''} ${plan.value.version || ''}，` +
-        `来源：${plan.value.source}）。看一眼方案，点「按此方案搭建」我就开拉；不放心点「拒绝，暂停」。`)
+        `来源：${plan.value.source}，${plan.value.size_estimate || '体积未知'}）。` +
+        '看一眼方案，点「按此方案搭建」我就开拉；不放心点「拒绝，暂停」。')
     } else if (plan.value) {
       aiSay('sys', `规划结论：拿不到程序本体。${plan.value.reason || ''}`)
     }
@@ -510,9 +551,23 @@ function autoBuildFromQuery() {
   router.replace({ query: { ...route.query, vid: undefined } })
 }
 
+/** 刷新页面后接管还在进行的搭建：列表里有 building 的环境就把轮询和播报接回去。 */
+async function recoverBuilding() {
+  try {
+    const r = await listEnvs()
+    const building = (r.items || []).find((e) => e.status === 'building')
+    if (!building) return
+    aiOpen.value = true
+    aiSay('sys', `检测到进行中的搭建（${building.component || building.id}，` +
+      `关联 ${(building.vulns || []).join(', ') || '未知漏洞'}），已接回播报，进度我会继续跟。`)
+    startPoll((building.vulns || [])[0] || building.id)
+  } catch { /* 列表都拿不到就算了，别阻塞首屏 */ }
+}
+
 onMounted(() => {
   load()
   autoBuildFromQuery()
+  recoverBuilding()
 })
 watch(() => route.query.vid, (nv, ov) => {
   if (nv && nv !== ov && route.path === '/envs') autoBuildFromQuery()
