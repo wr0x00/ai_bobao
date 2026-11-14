@@ -33,7 +33,7 @@ class FakeLLM:
         self.reply = reply
         self.calls = []
 
-    def chat(self, system, user):
+    def chat(self, system, user, timeout=None):
         self.calls.append((system, user))
         return self.reply
 

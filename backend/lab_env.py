@@ -59,6 +59,11 @@ MAX_OVERLAY = 4                   # 补充仓库最多几个
 MAX_SETUP = 12                    # 容器内准备命令最多几条
 MAX_CMD_LEN = 300                 # 单条命令最长多少字符
 
+# 「先看方案」是界面上的交互动作，用户在面板前等着：单次 LLM 调用最多等 60 秒。
+# 全局 llm.timeout 是 300 秒、底层还会重试两次，套上能拖到十分钟——网关挂住时
+# 用户只会觉得「点了没反应」，不如早点如实报失败。
+PLAN_TIMEOUT = 60
+
 # 环境状态
 STATUS_READY = "ready"        # 已就绪，未启动
 STATUS_RUNNING = "running"    # 服务真的在监听（健康检查通过）
@@ -420,7 +425,8 @@ def plan_env(vid: str, llm=None) -> dict:
         "refs": list(v.get("refs") or [])[:5],
     }
     try:
-        r = llm.chat(_PLAN_SYS, json.dumps(brief, ensure_ascii=False))
+        r = llm.chat(_PLAN_SYS, json.dumps(brief, ensure_ascii=False),
+                     timeout=PLAN_TIMEOUT)
     except Exception as e:  # LLM 挂了就是给不出方案，如实说
         raise EnvError(f"LLM 不可用：{e}", 502) from e
     return _norm_plan(r if isinstance(r, dict) else {})

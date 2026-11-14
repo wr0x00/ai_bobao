@@ -73,11 +73,13 @@ async function req(url, options = {}) {
  *
  * @param {string} url 请求地址
  * @param {object} [body] 请求体
+ * @param {object} [options] 额外的 fetch 选项（比如 AbortController 的 signal）
  * @returns {Promise<object>} 后端返回的 JSON
  */
-const post = (url, body) => req(url, {
+const post = (url, body, options = {}) => req(url, {
     method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
+    ...options,
+    headers: { 'Content-Type': 'application/json', ...(options.headers || {}) },
     body: JSON.stringify(body || {}),
 })
 
@@ -155,8 +157,9 @@ export const listEnvs = () => req('/api/envs')
 
 export const getEnv = (id) => req(`/api/envs/${encodeURIComponent(id)}`)
 
-// 只让 LLM 出方案，不拉任何东西
-export const resolveEnv = (vid) => post('/api/envs/resolve', { vid })
+// 只让 LLM 出方案，不拉任何东西。options 用来传 AbortController 的 signal，
+// 规划网关挂住时用户点「拒绝，暂停」能真的把它掐掉。
+export const resolveEnv = (vid, options = {}) => post('/api/envs/resolve', { vid }, options)
 
 // 为一条漏洞搭环境：拉程序/源码/镜像，找不到就放弃。plan 是用户审批过的方案，
 // 带回来就按方案搭、不再问 LLM；不带则视为未审批（后端也会拒绝盲搭）。

@@ -50,18 +50,6 @@ python main.py
 
 打开 `http://127.0.0.1:8100`，页面和 API 都在这一个端口上。
 
-> **开箱即用**：前端构建产物（`backend/static/`）已随仓库附带，
-> 克隆下来直接跑，**不需要装 Node、不需要 `npm install`、不需要 `npm run build`**。
-> 仓库里也只要求 Python 3.11+ 与一条 `pip install`。
->
-> **前后端不分离**：FastAPI 直接托管 `backend/static` 里的构建产物，
-> 前端所有请求都是相对路径 `/api/...`，天然同源——不用再单独起 vite dev server，
-> 也没有跨域和「两个服务端口对不上」的问题。
-> 深链（`/envs`、`/vuln/<id>` 等）刷新会回落到 `index.html` 交给前端路由，不会 404。
->
-> **前端开发者**：源码仍在 `frontend/`。改完前端后 `cd frontend && npm install && npm run build`
-> 会把新产物覆盖回 `backend/static/`（提交时记得一起带上）；开发调试时可用
-> `cd frontend && npm run dev`（5173 端口，代理 `/api` 到后端）热更新，正式跑请用上面的单进程模式。
 
 ***
 

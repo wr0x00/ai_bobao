@@ -50,21 +50,6 @@ python main.py
 
 Open `http://127.0.0.1:8100` — both the UI and the API live on that single port.
 
-> **Works out of the box**: the built frontend assets (`backend/static/`) ship with the repository.
-> Clone it and run — **no Node, no `npm install`, no `npm run build`**. All you need is
-> Python 3.11+ and one `pip install`.
->
-> **Monolithic deployment**: FastAPI serves the built assets in `backend/static` directly.
-> Every frontend request is a relative `/api/...` path, so it is same-origin by construction —
-> no separate vite dev server, no CORS, no "the two services disagree on the port" class of bugs.
-> Deep links (`/envs`, `/vuln/<id>`, …) fall back to `index.html` and are handed to the client-side
-> router, so a hard refresh never 404s.
->
-> **Frontend developers**: the source still lives in `frontend/`. After changing it, run
-> `cd frontend && npm install && npm run build` — the new assets overwrite `backend/static/`
-> (commit them along with the source). For hot reload during development you can use
-> `cd frontend && npm run dev` (port 5173, proxying `/api` to the backend); use the single-process
-> mode above for actual runs.
 
 ---
 

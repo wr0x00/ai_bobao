@@ -45,12 +45,15 @@ class LLM:
         self.key = key or config.get("llm", "key")
         self.model = model or config.get("llm", "model")
 
-    def _post_chat(self, endpoint: str, body: bytes) -> bytes:
+    def _post_chat(self, endpoint: str, body: bytes, timeout: int | None = None) -> bytes:
         """发对话请求，瞬时错误（限流/5xx/网络抖动）自动重试两次。
 
         服务商偶发 500/429 是家常便饭（本家刚见过：ModelScope 限流 429、
         nccsec 网关 500），直接把异常甩给上层，用户看到的就是「LLM 不可用」。
         这种抖动值得在底层消掉：2s、4s 退避重试，确定性错误照样立刻抛。
+
+        timeout 为空时用配置里的全局超时；交互式的小请求可以传更小的值，
+        免得网关挂住时让人在界面上干等十分钟。
         """
         err: Exception | None = None
         for attempt in range(3):
@@ -59,7 +62,7 @@ class LLM:
             try:
                 return security.open_url(
                     endpoint,
-                    timeout=config.get("llm", "timeout"),
+                    timeout=timeout or config.get("llm", "timeout"),
                     max_bytes=MAX_REPLY,
                     method="POST",
                     data=body,
@@ -77,7 +80,7 @@ class LLM:
                 logger.warning("LLM 网络抖动（%s），第 %s 次重试", e, attempt + 1)
         raise err  # type: ignore[misc]
 
-    def chat(self, system: str, user: str) -> dict:
+    def chat(self, system: str, user: str, timeout: int | None = None) -> dict:
         """问模型一句话，期望回一段 JSON。
 
         地址先校验后发送，校验不过就直接拒绝，绝不带着密钥往外跑。
@@ -91,7 +94,7 @@ class LLM:
                          {"role": "user", "content": user}],
             "response_format": {"type": "json_object"},
         }).encode()
-        raw = self._post_chat(endpoint, body)
+        raw = self._post_chat(endpoint, body, timeout)
         content = json.loads(raw)["choices"][0]["message"]["content"]
         return json.loads(content)
 

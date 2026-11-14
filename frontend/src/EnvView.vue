@@ -23,7 +23,7 @@
         <input v-model="vid" placeholder="漏洞 ID（可从漏洞详情页地址栏复制，如 CVE-2024-1234）" />
         <button @click="doResolve" :disabled="busy">{{ busy ? '处理中…' : '先看方案' }}</button>
         <button class="primary" @click="doBuild" :disabled="busy || !vid || !plan">按此方案搭建</button>
-        <button class="danger" @click="rejectPlan" :disabled="busy || !plan">拒绝，暂停</button>
+        <button class="danger" @click="rejectPlan">拒绝，暂停</button>
         <button @click="building = false">关闭</button>
       </div>
       <div v-if="plan" class="plan">
@@ -176,6 +176,14 @@ const vid = ref('')
 const plan = ref(null)
 const detail = ref(null)
 
+// 规划请求的取消器。LLM 网关一挂，规划能卡好几分钟（服务端还会重试），
+// 期间 busy 一直为真，面板上所有按钮都会被禁用——用户连「拒绝，暂停」都点不了。
+// 留个 AbortController，「拒绝，暂停」就能真的把它掐掉。
+let resolveCtrl = null
+// 搭建请求是否还在飞。搭建一旦开拉就在服务器那边跑着，浏览器掐不断，
+// 所以拒绝时要如实告诉用户：停下来的是规划，不是已经开拉的构建。
+let buildInFlight = false
+
 const running = computed(() => items.value.filter((e) => e.status === 'running').length)
 
 /** 状态标签的中文说法。building/starting 是中间态：正在搭/容器起了服务还没监听。 */
@@ -296,22 +304,51 @@ async function doResolve() {
   msg.value = ''
   aiOpen.value = true
   aiSay('sys', `正在把漏洞 ${vid.value.trim()} 交给 LLM 规划复现方案（判断组件/版本、从哪拿程序本体、要占多少磁盘）…`)
+  const ctrl = new AbortController()
+  resolveCtrl = ctrl
+  // 最多等 200 秒：服务端单次 60 秒、超时还重试两次，兜住整轮。
+  // 再久用户就该以为页面死了，不如早点报失败让人重试。
+  const timer = setTimeout(() => ctrl.abort('timeout'), 200000)
   try {
-    const r = await resolveEnv(vid.value.trim())
+    const r = await resolveEnv(vid.value.trim(), { signal: ctrl.signal })
     plan.value = r.plan
     planNarrate(r.plan)
   } catch (e) {
-    error.value = e.message
-    aiSay('sys', `规划失败：${e.message}`)
+    if (ctrl.signal.aborted) {
+      // 用户点的「拒绝，暂停」不算出错，别拿红色报错吓人
+      if (ctrl.signal.reason === 'timeout') {
+        error.value = '规划超时（LLM 200 秒没回），点「先看方案」重试'
+        aiSay('sys', '规划超时了，已放弃这次规划。点「先看方案」可以重试。')
+      }
+    } else {
+      error.value = e.message
+      aiSay('sys', `规划失败：${e.message}`)
+    }
   } finally {
+    clearTimeout(timer)
+    if (resolveCtrl === ctrl) resolveCtrl = null
     busy.value = false
   }
 }
 
 /** 拒绝方案：只出方案不动手。体积太大、来源可疑、纯粹不想搭——理由用户自己定，
- *  这里只负责把方案收起来、状态挂起，什么时候想搭了再「先看方案」。 */
+ *  这里只负责把方案收起来、状态挂起，什么时候想搭了再「先看方案」。
+ *
+ *  规划还在飞就顺手掐掉：LLM 网关挂住时这一次请求能拖好几分钟，
+ *  用户能点的唯一出口就是这里，不能因为「方案还没出来」把按钮禁掉。 */
 function rejectPlan() {
+  if (resolveCtrl) {
+    resolveCtrl.abort('rejected')
+    resolveCtrl = null
+  }
+  busy.value = false
   plan.value = null
+  if (buildInFlight) {
+    // 搭建已经在服务器那边开跑了，浏览器这边掐不断，得说清楚
+    msg.value = '搭建已经在后台继续（服务器那边停不下来），不会自动开打 PoC；想彻底停掉，去下面环境卡片点「停止」。'
+    aiSay('sys', msg.value)
+    return
+  }
   msg.value = '已拒绝方案，搭建暂停。想重新规划就再点「先看方案」。'
   aiSay('sys', '方案已拒绝，搭建暂停。想重新规划随时点「先看方案」。')
 }
@@ -328,6 +365,7 @@ async function doBuild() {
   const target = vid.value.trim()
   aiSay('sys', `已批准方案，开始为 ${target} 搭建复现环境，拉源码/构建镜像要几分钟，进展我会随时播报。`)
   startPoll(target)
+  buildInFlight = true
   try {
     const r = await buildEnv(target, plan.value)
     stopPoll()
@@ -359,6 +397,7 @@ async function doBuild() {
     error.value = e.message
     aiSay('sys', `搭建请求出错：${e.message}`)
   } finally {
+    buildInFlight = false
     busy.value = false
   }
 }
