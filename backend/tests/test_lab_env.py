@@ -191,7 +191,7 @@ def test_build_docker_pulls_and_records(monkeypatch):
     vid = _make_vuln()
     calls = []
 
-    def fake_pull(image, timeout):
+    def fake_pull(image, timeout, cancel=None):
         calls.append(image)
         return True, "pulled"
 
@@ -215,7 +215,7 @@ def test_build_source_clones(monkeypatch, tmp_path):
     vid = _make_vuln()
     seen = {}
 
-    def fake_clone(url, dest, timeout, ref=""):
+    def fake_clone(url, dest, timeout, ref="", cancel=None):
         seen["url"] = url
         seen["dest"] = dest
         dest.mkdir(parents=True, exist_ok=True)
@@ -234,7 +234,7 @@ def test_build_shares_env_between_vulns(monkeypatch):
     """同一个组件+版本+来源，多条漏洞共享同一个环境，不重复拉。"""
     pulls = []
 
-    def fake_pull(image, timeout):
+    def fake_pull(image, timeout, cancel=None):
         pulls.append(image)
         return True, "pulled"
 
@@ -257,7 +257,7 @@ def test_build_shares_env_between_vulns(monkeypatch):
 def test_build_failure_records_reason(monkeypatch):
     vid = _make_vuln()
     monkeypatch.setattr(lab_env, "_pull_docker",
-                        lambda image, timeout: (False, "镜像拉取失败：网络超时"))
+                        lambda image, timeout, cancel=None: (False, "镜像拉取失败：网络超时"))
     llm = FakeLLM({"component": "Tomcat", "version": "9.0", "source": "docker",
                     "image": "tomcat:9.0", "available": True})
     r = lab_env.build(vid, llm=llm)
@@ -311,7 +311,7 @@ def test_list_envs_reports_root_and_docker(monkeypatch):
 def test_get_env_returns_asset_paths(monkeypatch):
     vid = _make_vuln()
 
-    def fake_clone(url, dest, timeout, ref=""):
+    def fake_clone(url, dest, timeout, ref="", cancel=None):
         dest.mkdir(parents=True, exist_ok=True)
         return True, "cloned"
 
@@ -326,7 +326,8 @@ def test_get_env_returns_asset_paths(monkeypatch):
 
 def test_delete_env_clears_link(monkeypatch):
     vid = _make_vuln()
-    monkeypatch.setattr(lab_env, "_pull_docker", lambda image, timeout: (True, "pulled"))
+    monkeypatch.setattr(lab_env, "_pull_docker",
+                        lambda image, timeout, cancel=None: (True, "pulled"))
     llm = FakeLLM({"component": "Tomcat", "version": "9.0", "source": "docker",
                     "image": "tomcat:9.0", "available": True})
     r = lab_env.build(vid, llm=llm)
@@ -345,7 +346,8 @@ def test_get_env_404():
 def test_agent_list_envs_tool_reads_items(monkeypatch):
     """agent 的 list_envs 工具：环境在 list_envs()["items"] 里，别把 dict 当 list 迭代。"""
     vid = _make_vuln()
-    monkeypatch.setattr(lab_env, "_pull_docker", lambda image, timeout: (True, "pulled"))
+    monkeypatch.setattr(lab_env, "_pull_docker",
+                        lambda image, timeout, cancel=None: (True, "pulled"))
     llm = FakeLLM({"component": "Tomcat", "version": "9.0", "source": "docker",
                     "image": "tomcat:9.0", "available": True})
     lab_env.build(vid, llm=llm)
@@ -357,11 +359,38 @@ def test_agent_list_envs_tool_reads_items(monkeypatch):
 
 
 # ── 启动 / 停止 ───────────────────────────────────────────
+def test_cancel_build_highest_priority(monkeypatch):
+    """「拒绝，停止」是最高优先级：拉取进行中点了停止，环境记失败（用户取消），
+    后续步骤不再执行，最终写盘不许覆盖「用户取消」。"""
+    vid = _make_vuln()
+
+    def fake_pull(image, timeout, cancel=None):
+        # 模拟用户在拉取进行中点了「拒绝，停止」
+        lab_env.cancel_build(vid)
+        assert cancel is not None and cancel.is_set()
+        return False, "命令已被用户取消"
+
+    monkeypatch.setattr(lab_env, "_pull_docker", fake_pull)
+    llm = FakeLLM({"component": "Tomcat", "version": "9.0", "source": "docker",
+                    "image": "tomcat:9.0", "available": True})
+    r = lab_env.build(vid, llm=llm)
+    assert r.get("canceled") is True
+    assert r["env"]["status"] == lab_env.STATUS_FAILED
+    assert r["env"]["reason"] == "用户取消"
+    # build 结束后取消事件要被注销，别留着下次误触
+    assert vid not in lab_env._CANCEL
+    # 对没有活动任务的漏洞再点一次取消，也要安全返回
+    r2 = lab_env.cancel_build(vid)
+    assert r2["ok"] is True and r2["canceled"] is False
+
+
 def test_start_docker_env(monkeypatch):
     vid = _make_vuln()
-    monkeypatch.setattr(lab_env, "_pull_docker", lambda image, timeout: (True, "pulled"))
+    monkeypatch.setattr(lab_env, "_pull_docker",
+                        lambda image, timeout, cancel=None: (True, "pulled"))
     monkeypatch.setattr(lab_env, "docker_available", lambda: True)
-    monkeypatch.setattr(lab_env, "_run", lambda args, timeout=300, cwd=None: (0, "container started"))
+    monkeypatch.setattr(lab_env, "_run",
+                        lambda args, timeout=300, cwd=None, cancel=None: (0, "container started"))
     llm = FakeLLM({"component": "Tomcat", "version": "9.0", "source": "docker",
                     "image": "tomcat:9.0", "available": True, "ports": [8080]})
     r = lab_env.build(vid, llm=llm)
@@ -377,7 +406,7 @@ def test_start_docker_env(monkeypatch):
 def test_start_refuses_failed_env(monkeypatch):
     vid = _make_vuln()
     monkeypatch.setattr(lab_env, "_pull_docker",
-                        lambda image, timeout: (False, "pull failed"))
+                        lambda image, timeout, cancel=None: (False, "pull failed"))
     llm = FakeLLM({"component": "Tomcat", "version": "9.0", "source": "docker",
                     "image": "tomcat:9.0", "available": True})
     r = lab_env.build(vid, llm=llm)
@@ -387,9 +416,11 @@ def test_start_refuses_failed_env(monkeypatch):
 
 def test_stop_env(monkeypatch):
     vid = _make_vuln()
-    monkeypatch.setattr(lab_env, "_pull_docker", lambda image, timeout: (True, "pulled"))
+    monkeypatch.setattr(lab_env, "_pull_docker",
+                        lambda image, timeout, cancel=None: (True, "pulled"))
     monkeypatch.setattr(lab_env, "docker_available", lambda: True)
-    monkeypatch.setattr(lab_env, "_run", lambda args, timeout=300, cwd=None: (0, "ok"))
+    monkeypatch.setattr(lab_env, "_run",
+                        lambda args, timeout=300, cwd=None, cancel=None: (0, "ok"))
     llm = FakeLLM({"component": "Tomcat", "version": "9.0", "source": "docker",
                     "image": "tomcat:9.0", "available": True})
     r = lab_env.build(vid, llm=llm)
@@ -425,15 +456,22 @@ def test_run_uses_argv_not_shell(monkeypatch):
 
     class FakeProc:
         returncode = 0
-        stdout = b"ok"
-        stderr = b""
 
-    def fake_run(args, **kw):
+        def communicate(self, timeout=None):
+            return b"ok", b""
+
+        def kill(self):
+            pass
+
+        def wait(self, timeout=None):
+            return 0
+
+    def fake_popen(args, **kw):
         seen["args"] = args
         seen["shell"] = kw.get("shell")
         return FakeProc()
 
-    monkeypatch.setattr(lab_env.subprocess, "run", fake_run)
+    monkeypatch.setattr(lab_env.subprocess, "Popen", fake_popen)
     code, _out = lab_env._run(["git", "clone", "https://x/$(whoami).git"])
     assert code == 0
     assert seen["args"][-1] == "https://x/$(whoami).git"

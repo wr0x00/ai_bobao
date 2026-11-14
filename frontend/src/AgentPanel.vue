@@ -456,6 +456,7 @@ async function ask(text) {
         const live = msgs.value[msgs.value.length - 1]
         let lastField = ''
         let streamErr = ''
+        const liveSteps = []
         await agentChatStream([{ role: 'user', content: body }], uiContext(), curId.value,
             chatOpts(), (ev) => {
             if (ev.type === 'text') {
@@ -471,7 +472,9 @@ async function ask(text) {
                 }
                 live.content += ev.text
             } else if (ev.type === 'step') {
-                live.content += `\n〔已执行〕${ev.step.tool}：${ev.step.out}`
+                // 工具调用收进折叠面板实时更新，不往正文里追加〔已执行〕行
+                liveSteps.push(ev.step)
+                live.steps = stepsView(liveSteps)
                 lastField = ''
             } else if (ev.type === 'done') {
                 live.content = ev.reply

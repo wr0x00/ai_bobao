@@ -1108,6 +1108,20 @@ async def api_build_env(req: EnvReq):
     return r
 
 
+@app.post("/api/envs/cancel")
+async def api_cancel_env(req: EnvReq):
+    """最高优先级取消：立即终止该漏洞本次环境搭建的一切进行中任务。
+
+    正在跑的 docker pull / git clone / docker build 子进程马上被杀；
+    环境还在「构建中」就记失败，已在运行/启动中就立刻停容器。
+    """
+    try:
+        vid = security.require_vid(req.vid)
+    except security.SecurityError as e:
+        raise HTTPException(400, str(e)) from e
+    return await asyncio.to_thread(lab_env.cancel_build, vid)
+
+
 @app.post("/api/envs/{eid}/start")
 async def api_start_env(eid: str = Path(max_length=32)):
     """启动环境：docker 环境起容器，源码/二进制环境起进程。"""

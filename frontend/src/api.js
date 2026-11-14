@@ -221,11 +221,17 @@ export const resolveEnv = (vid, options = {}) => post('/api/envs/resolve', { vid
 
 // 为一条漏洞搭环境：拉程序/源码/镜像，找不到就放弃。plan 是用户审批过的方案，
 // 带回来就按方案搭、不再问 LLM；不带则视为未审批（后端也会拒绝盲搭）。
-export const buildEnv = (vid, plan = null) => post('/api/envs/build', { vid, plan })
+// options 可传 AbortController 的 signal，「拒绝，停止」要真的掐断这个请求。
+export const buildEnv = (vid, plan = null, options = {}) =>
+    post('/api/envs/build', { vid, plan }, options)
 
 export const startEnv = (id) => post(`/api/envs/${encodeURIComponent(id)}/start`)
 
 export const stopEnv = (id) => post(`/api/envs/${encodeURIComponent(id)}/stop`)
+
+// 最高优先级取消：立即终止该漏洞本次环境搭建的一切进行中任务
+// （杀正在跑的 docker pull / git clone / docker build，停已起的容器）
+export const cancelEnv = (vid) => post('/api/envs/cancel', { vid })
 
 // 拿库里这条漏洞的 PoC 真打这个环境，验证能不能复现
 // vid 可选：不传就用环境关联的第一条漏洞

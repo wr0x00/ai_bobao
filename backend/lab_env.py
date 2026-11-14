@@ -88,6 +88,36 @@ _NO_WINDOW = getattr(subprocess, "CREATE_NO_WINDOW", 0) if os.name == "nt" else 
 # 同一时刻只允许一个环境在构建，别把磁盘和 Docker 同时塞满
 _build_lock = threading.Lock()
 
+# 构建取消事件：vid → Event。build() 开头注册、finally 注销；cancel_build()
+# 把事件一 set，正在跑的 docker pull / git clone / docker build 子进程立刻被杀，
+# 各阶段间的检查点也会让 build() 不再往下走。用户点「拒绝，停止」是最高优先级。
+_CANCEL: dict[str, threading.Event] = {}
+
+
+def _canceled_result(d: Path, plan: dict, eid: str, meta: dict, vid: str) -> dict:
+    """构建被用户取消：把环境记成失败（原因「用户取消」），返回取消结果。
+
+    后续的正常写盘不会再发生——各检查点命中后直接 return，不会被覆盖。
+    """
+    rec = {
+        "id": eid, "component": plan["component"], "version": plan["version"],
+        "device": plan["device"], "source": plan["source"], "mode": plan["mode"],
+        "image": _built_tag(eid) if plan["mode"] == "build" else plan["image"],
+        "base_image": plan["base_image"],
+        "repo": plan["repo"], "ref": plan["ref"], "overlay": plan["overlay"],
+        "release": plan["release"], "cmd": plan["cmd"], "setup": plan["setup"],
+        "ports": plan["ports"], "port_map": plan["port_map"],
+        "size_estimate": plan.get("size_estimate", ""),
+        "status": STATUS_FAILED, "reason": "用户取消",
+        "vulns": _merge_vulns(meta, vid),
+        "created_at": (meta or {}).get("created_at") or _now(), "log": "用户取消",
+        "dir": str(d),
+    }
+    _write_meta(d, rec)
+    store.patch_meta(vid, {"env_id": eid, "env_status": STATUS_FAILED})
+    logger.info("环境 %s 构建被用户取消", eid)
+    return {"ok": False, "canceled": True, "env": _view(rec), "reason": "用户取消"}
+
 
 class EnvError(Exception):
     """环境模块失败。status 供 HTTP 层选状态码，message 是给用户看的说明。"""
@@ -204,25 +234,49 @@ def _view(m: dict) -> dict:
 
 
 # ── 外部命令 ──────────────────────────────────────────────
-def _run(args: list[str], timeout: int = 300, cwd: Path | None = None) -> tuple[int, str]:
+def _run(args: list[str], timeout: int = 300, cwd: Path | None = None,
+         cancel: threading.Event | None = None) -> tuple[int, str]:
     """跑一条外部命令，返回 (退出码, 输出文本)。
 
     一律用参数数组、不开 shell，命令内容里带空格、引号、$ 都当普通字符传给程序，
     不会被 shell 再解释一遍。输出按 UTF-8 解码、坏字节替换，Windows 控制台
     编码是 GBK，不这么处理日志全是乱码。
+
+    cancel 给了就在 0.5 秒粒度上盯着：事件一 set 立刻杀掉子进程返回 130，
+    docker pull / git clone 这类长命令才能做到「点停止马上停」，而不是等它跑完。
     """
     try:
-        r = subprocess.run(
-            args, capture_output=True, timeout=timeout,
+        proc = subprocess.Popen(
+            args, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
             cwd=str(cwd) if cwd else None, shell=False, creationflags=_NO_WINDOW)
     except FileNotFoundError:
         return 127, f"命令不存在：{args[0]}"
-    except subprocess.TimeoutExpired:
-        return 124, f"命令超时（{timeout}s）：{' '.join(args[:2])}"
     except OSError as e:
         return 1, f"命令执行失败：{e}"
-    out = (r.stdout or b"") + b"\n" + (r.stderr or b"")
-    return r.returncode, out.decode("utf-8", "replace").strip()
+    deadline = time.monotonic() + max(timeout, 1)
+    out: bytes = b""
+    err: bytes = b""
+    while True:
+        if cancel is not None and cancel.is_set():
+            proc.kill()
+            try:
+                proc.wait(timeout=10)
+            except subprocess.TimeoutExpired:
+                pass
+            return 130, "命令已被用户取消"
+        try:
+            out, err = proc.communicate(timeout=0.5)
+            break  # 进程正常退出
+        except subprocess.TimeoutExpired:
+            if time.monotonic() >= deadline:
+                proc.kill()
+                try:
+                    proc.wait(timeout=10)
+                except subprocess.TimeoutExpired:
+                    pass
+                return 124, f"命令超时（{timeout}s）：{' '.join(args[:2])}"
+    out = out + b"\n" + err
+    return proc.returncode, out.decode("utf-8", "replace").strip()
 
 
 def docker_available() -> bool:
@@ -528,12 +582,15 @@ def _fingerprint(plan: dict) -> str:
 
 
 # ── 拉取执行 ──────────────────────────────────────────────
-def _pull_docker(image: str, timeout: int) -> tuple[bool, str]:
+def _pull_docker(image: str, timeout: int,
+                 cancel: threading.Event | None = None) -> tuple[bool, str]:
     if not _docker_enabled():
         return False, "设置里已关闭 docker 拉取"
     if not docker_available():
         return False, "本机没有可用的 Docker"
-    code, out = _run(["docker", "pull", image], timeout=timeout)
+    code, out = _run(["docker", "pull", image], timeout=timeout, cancel=cancel)
+    if code == 130:
+        return False, out
     if code != 0:
         return False, f"镜像拉取失败：{out[-500:]}"
     return True, out[-500:]
@@ -569,7 +626,8 @@ def _is_unavailable(log: str) -> bool:
     return any(m.lower() in low for m in _UNAVAILABLE_MARKS)
 
 
-def _pull_source(url: str, dest: Path, timeout: int, ref: str = "") -> tuple[bool, str]:
+def _pull_source(url: str, dest: Path, timeout: int, ref: str = "",
+                 cancel: threading.Event | None = None) -> tuple[bool, str]:
     """clone 官方源码仓库。地址先过 SSRF 网关，挡内网与云元数据地址。
 
     ref 给了就拉那个分支/tag（--branch 对 tag 同样管用），不拉默认分支。
@@ -589,13 +647,16 @@ def _pull_source(url: str, dest: Path, timeout: int, ref: str = "") -> tuple[boo
     if ref:
         args += ["--branch", ref]
     args += [url, str(dest)]
-    code, out = _run(args, timeout=timeout)
+    code, out = _run(args, timeout=timeout, cancel=cancel)
+    if code == 130:
+        return False, out
     if code != 0:
         return False, f"源码拉取失败：{out[-500:]}"
     return True, out[-500:]
 
 
-def _pull_overlay(items: list[dict], base: Path, timeout: int) -> tuple[bool, str]:
+def _pull_overlay(items: list[dict], base: Path, timeout: int,
+                  cancel: threading.Event | None = None) -> tuple[bool, str]:
     """把补充仓库拉到指定子目录。
 
     典型场景：应用骨架仓库里没有框架本体（ThinkPHP 的 top-think/think 只算
@@ -610,7 +671,7 @@ def _pull_overlay(items: list[dict], base: Path, timeout: int) -> tuple[bool, st
             target = security.safe_join(base, dest)
         except security.SecurityError as e:
             return False, f"补充仓库落盘路径不合法：{e}"
-        ok, out = _pull_source(repo, target, timeout, ref)
+        ok, out = _pull_source(repo, target, timeout, ref, cancel)
         if not ok:
             return False, f"补充仓库拉取失败（{repo}）：{out[-300:]}"
         logs.append(f"{repo}@{ref or 'HEAD'} → {dest}")
@@ -663,7 +724,8 @@ def _dockerfile_text(plan: dict) -> str:
     return "\n".join(lines) + "\n"
 
 
-def _build_image(plan: dict, d: Path, timeout: int, eid: str) -> tuple[bool, str]:
+def _build_image(plan: dict, d: Path, timeout: int, eid: str,
+                 cancel: threading.Event | None = None) -> tuple[bool, str]:
     """用基础镜像 + 落盘的程序本体自建一个镜像。"""
     base = str(plan.get("base_image") or "")
     if not base or not _IMAGE_RE.match(base) or ".." in base:
@@ -672,7 +734,7 @@ def _build_image(plan: dict, d: Path, timeout: int, eid: str) -> tuple[bool, str
         return False, "设置里已关闭 docker 拉取"
     if not docker_available():
         return False, "本机没有可用的 Docker"
-    ok, log = _pull_docker(base, timeout)
+    ok, log = _pull_docker(base, timeout, cancel)
     if not ok:
         return False, f"基础镜像拉取失败：{log[-300:]}"
     tag = f"ai_bb_lab_{eid}:1" if eid else "ai_bb_lab_build:1"
@@ -680,7 +742,10 @@ def _build_image(plan: dict, d: Path, timeout: int, eid: str) -> tuple[bool, str
     df.write_text(_dockerfile_text(plan), encoding="utf-8")
     # .git 有几百 MB，拉进构建上下文纯粹浪费时间和磁盘
     (d / ".dockerignore").write_text(".git\n**/.git\n", encoding="utf-8")
-    code, out = _run(["docker", "build", "-t", tag, "-f", str(df), str(d)], timeout=timeout)
+    code, out = _run(["docker", "build", "-t", tag, "-f", str(df), str(d)],
+                     timeout=timeout, cancel=cancel)
+    if code == 130:
+        return False, out
     if code != 0:
         return False, f"镜像构建失败：{out[-800:]}"
     code, out = _run(["docker", "image", "inspect", tag, "--format", "{{.Size}}"], timeout=60)
@@ -693,31 +758,35 @@ def _build_image(plan: dict, d: Path, timeout: int, eid: str) -> tuple[bool, str
     return True, f"自建镜像 {tag}"
 
 
-def _build_assets(plan: dict, d: Path, timeout: int, eid: str = "") -> tuple[bool, str]:
+def _build_assets(plan: dict, d: Path, timeout: int, eid: str = "",
+                  cancel: threading.Event | None = None) -> tuple[bool, str]:
     """按方案真去拉程序本体。返回 (成功与否, 说明)。"""
     src = plan["source"]
     mode = str(plan.get("mode") or "")
     if src == SRC_DOCKER:
-        return _pull_docker(plan["image"], timeout)
+        return _pull_docker(plan["image"], timeout, cancel)
     if src == SRC_SOURCE:
-        ok, log = _pull_source(plan["repo"], d / "source", timeout, plan.get("ref", ""))
+        ok, log = _pull_source(plan["repo"], d / "source", timeout,
+                               plan.get("ref", ""), cancel)
         if not ok:
             return False, log
         overlay = plan.get("overlay") or []
         if overlay:
-            ok2, log2 = _pull_overlay(overlay, d / "source", timeout)
+            ok2, log2 = _pull_overlay(overlay, d / "source", timeout, cancel)
             if not ok2:
                 return False, log2
             log = f"{log}\n{log2}".strip()
         if mode == "build":
-            return _build_image(plan, d, timeout, eid)
+            return _build_image(plan, d, timeout, eid, cancel)
         return True, log
     if src == SRC_RELEASE:
         ok, log = _pull_release(plan["release"], d / "binary", timeout)
         if not ok:
             return False, log
+        if cancel is not None and cancel.is_set():
+            return False, "命令已被用户取消"
         if mode == "build":
-            return _build_image(plan, d, timeout, eid)
+            return _build_image(plan, d, timeout, eid, cancel)
         return True, log
     return False, plan.get("reason") or "网上找不到可获取的程序本体"
 
@@ -737,6 +806,7 @@ def build(vid: str, llm=None, plan: dict | None = None) -> dict:
     if not v:
         raise EnvError("漏洞不存在", 404)
 
+    ev = _CANCEL.setdefault(vid, threading.Event())
     if not _build_lock.acquire(blocking=False):
         raise EnvError("已有环境在构建中，稍后再试", 429)
     try:
@@ -747,6 +817,14 @@ def build(vid: str, llm=None, plan: dict | None = None) -> dict:
         eid = _fingerprint(plan)
         d = _env_dir(eid)
         meta = _read_meta(d)
+
+        # 检查点 1：方案刚拿到。用户已经点了「拒绝/停止」就不往下走——
+        # 已经在跑的现成环境不受影响，新环境记成失败（用户取消）
+        if ev.is_set():
+            if meta and meta.get("status") in (STATUS_READY, STATUS_RUNNING):
+                return {"ok": False, "canceled": True, "env": _view(meta),
+                        "reason": "用户取消"}
+            return _canceled_result(d, plan, eid, meta, vid)
 
         # 已有能用的环境 → 共享，把这条漏洞挂上去
         if meta and meta.get("status") in (STATUS_READY, STATUS_RUNNING):
@@ -804,7 +882,13 @@ def build(vid: str, llm=None, plan: dict | None = None) -> dict:
         }
         meta = _write_meta(d, building)
         store.patch_meta(vid, {"env_id": eid, "env_status": STATUS_BUILDING})
-        ok, log = _build_assets(plan, d, timeout, eid)
+        # 检查点 2：马上要真去拉了（docker pull / git clone / 下载固件，都是长活）
+        if ev.is_set():
+            return _canceled_result(d, plan, eid, meta, vid)
+        ok, log = _build_assets(plan, d, timeout, eid, ev)
+        # 检查点 3：拉取/构建刚结束。被取消时正常的结果写盘不许覆盖「用户取消」
+        if ev.is_set():
+            return _canceled_result(d, plan, eid, meta, vid)
         # 拉不下来有两种：一种是这个东西网上压根没有（该放弃），一种是网络/环境
         # 临时抽风（该记失败，下次还能重试）。分清楚，别把"确实没有"记成故障。
         unavailable = (not ok) and _is_unavailable(log)
@@ -836,6 +920,9 @@ def build(vid: str, llm=None, plan: dict | None = None) -> dict:
         # 失败也不影响"环境已搭好"这个事实，只是要手动点一下启动。
         started_msg = ""
         if ok and (plan["ports"] or plan["port_map"]):
+            # 检查点 4：环境搭好了、还没起容器。取消了就不再启动
+            if ev.is_set():
+                return _canceled_result(d, plan, eid, meta, vid)
             try:
                 sr = start_env(eid)
                 meta = _read_meta(d)
@@ -845,7 +932,38 @@ def build(vid: str, llm=None, plan: dict | None = None) -> dict:
         return {"ok": ok, "env": _view(meta), "reason": reason,
                 "abandoned": unavailable, "auto_start": started_msg}
     finally:
+        _CANCEL.pop(vid, None)
         _build_lock.release()
+
+
+def cancel_build(vid: str) -> dict:
+    """最高优先级取消：立即终止该漏洞本次环境搭建的一切进行中任务。
+
+    1. set 取消事件 → build() 里的 docker pull / git clone / docker build
+       子进程在 0.5 秒内被杀，各检查点让后续步骤不再执行；
+    2. 环境处于「构建中」→ 直接记失败（用户取消）；
+    3. 环境已在运行/启动中 → 立即停掉容器。
+    """
+    ev = _CANCEL.get(vid)
+    if ev:
+        ev.set()
+    stopped: list[str] = []
+    v = store.get_vuln(vid)
+    eid = str((v or {}).get("env_id") or "")
+    if eid and _EID_RE.match(eid):
+        m = _read_meta(_env_dir(eid))
+        st = str(m.get("status") or "")
+        if st == STATUS_BUILDING:
+            _write_meta(_env_dir(eid), {**m, "status": STATUS_FAILED,
+                                        "reason": "用户取消", "log": "用户取消"})
+            store.patch_meta(vid, {"env_status": STATUS_FAILED})
+        elif st in (STATUS_RUNNING, STATUS_STARTING):
+            try:
+                stop_env(eid)
+                stopped.append(eid)
+            except EnvError:
+                pass
+    return {"ok": True, "canceled": bool(ev), "stopped": stopped}
 
 
 def list_envs() -> dict:

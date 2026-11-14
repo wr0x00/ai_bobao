@@ -23,7 +23,7 @@
         <input v-model="vid" placeholder="漏洞 ID（可从漏洞详情页地址栏复制，如 CVE-2024-1234）" />
         <button @click="doResolve" :disabled="busy">{{ busy ? '处理中…' : '先看方案' }}</button>
         <button class="primary" @click="doBuild" :disabled="busy || !vid || !plan">按此方案搭建</button>
-        <button class="danger" @click="rejectPlan">拒绝，暂停</button>
+        <button class="danger" @click="rejectAll">{{ plan ? '拒绝，暂停' : '拒绝，停止' }}</button>
         <button @click="building = false">关闭</button>
       </div>
       <div v-if="plan" class="plan">
@@ -178,8 +178,9 @@ defineOptions({ name: 'EnvView' })
 
 import { computed, nextTick, onMounted, ref, watch } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
-import { agentChatStream, buildEnv, clearSession, createSession, delEnv, downloadAgentExport,
-         genPoc, getEnv, listEnvs, resolveEnvStream, startEnv, stopEnv, verifyEnv } from './api'
+import { agentChatStream, buildEnv, cancelEnv, clearSession, createSession, delEnv,
+         downloadAgentExport, genPoc, getEnv, listEnvs, resolveEnvStream, startEnv,
+         stopEnv, verifyEnv } from './api'
 
 const route = useRoute()
 const router = useRouter()
@@ -200,8 +201,11 @@ const detail = ref(null)
 // 期间 busy 一直为真，面板上所有按钮都会被禁用——用户连「拒绝，暂停」都点不了。
 // 留个 AbortController，「拒绝，暂停」就能真的把它掐掉。
 let resolveCtrl = null
-// 搭建请求是否还在飞。搭建一旦开拉就在服务器那边跑着，浏览器掐不断，
-// 所以拒绝时要如实告诉用户：停下来的是规划，不是已经开拉的构建。
+// 搭建请求的取消器。「拒绝，停止」是最高优先级：规划流、搭建请求、后端正在跑的
+// docker pull / git clone / docker build 子进程、已经起来的容器，全部立即终止。
+let buildCtrl = null
+// 搭建请求是否还在飞。真正要停靠后端的 /api/envs/cancel（杀子进程、停容器），
+// 浏览器这边 abort 只是不再等结果。
 let buildInFlight = false
 
 const running = computed(() => items.value.filter((e) => e.status === 'running').length)
@@ -368,31 +372,34 @@ async function doResolve() {
   }
 }
 
-/** 拒绝方案：只出方案不动手。体积太大、来源可疑、纯粹不想搭——理由用户自己定，
- *  这里只负责把方案收起来、状态挂起，什么时候想搭了再「先看方案」。
+/** 拒绝 / 停止：本次环境搭建的最高优先级操作，点了就立即终止一切。
  *
- *  规划还在飞就顺手掐掉：LLM 网关挂住时这一次请求能拖好几分钟，
- *  用户能点的唯一出口就是这里，不能因为「方案还没出来」把按钮禁掉。 */
-function rejectPlan() {
+ *  1. 掐掉正在飞的规划流（AbortController，立即生效）；
+ *  2. 通知后端 /api/envs/cancel：正在跑的 docker pull / git clone / docker build
+ *     子进程马上被杀，「构建中」记失败，已在运行/启动中的容器立即停掉；
+ *  3. 掐掉搭建请求本身（不再等它的返回）。
+ *  不等任何请求回来、不被 busy 挡住——按钮永远可点。 */
+function rejectAll() {
   if (resolveCtrl) {
     resolveCtrl.abort('rejected')
     resolveCtrl = null
   }
+  const target = vid.value.trim()
+  // fire-and-forget：不等返回，先把手头的东西全掐了再说
+  if (target) cancelEnv(target).catch(() => {})
+  if (buildCtrl) {
+    buildCtrl.abort('rejected')
+    buildCtrl = null
+  }
   busy.value = false
   plan.value = null
-  if (buildInFlight) {
-    // 搭建已经在服务器那边开跑了，浏览器这边掐不断，得说清楚
-    msg.value = '搭建已经在后台继续（服务器那边停不下来），不会自动开打 PoC；想彻底停掉，去下面环境卡片点「停止」。'
-    aiSay('sys', msg.value)
-    return
-  }
-  msg.value = '已拒绝方案，搭建暂停。想重新规划就再点「先看方案」。'
-  aiSay('sys', '方案已拒绝，搭建暂停。想重新规划随时点「先看方案」。')
+  msg.value = '已停止本次环境搭建的全部任务。'
+  aiSay('sys', '已按最高优先级停止：规划、拉取/构建、已起的容器全部终止。想重新开始随时点「先看方案」。')
 }
 
 /** 真去搭环境：按用户审批过的方案拉程序/源码/镜像 → 落盘。
  *  没有审批过的方案就先规划等审批，绝不跳过用户直接开拉。
- *  搭建要几分钟，起一个轮询把 building → ready/failed 的状态变化播进 AI 框。 */
+ *  搭建要几分钟，常驻监视把 building → ready/failed 的状态变化播进 AI 框。 */
 async function doBuild() {
   if (!vid.value.trim()) { error.value = '先填漏洞 ID'; return }
   if (!plan.value) { error.value = '方案还没审批：先「出方案」，看一眼再按此方案搭建'; return }
@@ -401,11 +408,12 @@ async function doBuild() {
   msg.value = ''
   const target = vid.value.trim()
   aiSay('sys', `已批准方案，开始为 ${target} 搭建复现环境，拉源码/构建镜像要几分钟，进展我会随时播报。`)
-  startPoll(target)
+  startBgWatch()
   buildInFlight = true
+  const ctrl = new AbortController()
+  buildCtrl = ctrl
   try {
-    const r = await buildEnv(target, plan.value)
-    stopPoll()
+    const r = await buildEnv(target, plan.value, { signal: ctrl.signal })
     if (r.abandoned) {
       msg.value = `已放弃：${r.reason}`
       aiSay('sys', `已放弃：${r.reason}`)
@@ -421,19 +429,19 @@ async function doBuild() {
       aiSay('sys', `搭建完成${u ? `，真实容器已经跑起来了，浏览器打开 ${u} 就能手工验证` : ''}。` +
         `也可以直接让我「打 PoC 验证」，或点卡片上的「预览」在页面里看站点。`)
       building.value = false
-      // 自动启动走的是 starting → running，别急着停轮询：等健康检查转正再播一句
-      if (u) awaitRunning(target)
-      else stopPoll()
     } else {
       error.value = r.reason || '构建失败'
       aiSay('sys', `构建失败：${r.reason || '未知原因'}`)
     }
     await load()
   } catch (e) {
-    stopPoll()
-    error.value = e.message
-    aiSay('sys', `搭建请求出错：${e.message}`)
+    // 用户点的「拒绝，停止」掐断的不算出错，别拿红色报错吓人
+    if (!ctrl.signal.aborted) {
+      error.value = e.message
+      aiSay('sys', `搭建请求出错：${e.message}`)
+    }
   } finally {
+    if (buildCtrl === ctrl) buildCtrl = null
     buildInFlight = false
     busy.value = false
   }
@@ -449,7 +457,6 @@ const aiPending = ref(false)
 const aiSid = ref('')
 const aiBox = ref(null)
 const aiSent = ref(null)      // 本轮真正发给模型的请求体（后端回带）
-let pollTimer = null
 
 // 欢迎语里的示例，点一下就直接发给 agent
 const aiExamples = [
@@ -470,52 +477,47 @@ function aiSay(role, content, steps) {
   nextTick(() => aiBox.value?.scrollTo({ top: aiBox.value.scrollHeight, behavior: 'smooth' }))
 }
 
-/** 搭建期间轮询环境列表，状态一变就播报。 */
-function startPoll(targetVid) {
-  stopPoll()
+/** 常驻后台监视：每 3 秒刷一次环境列表（页面挂着就一直跑）。
+ *  1. 发现当前 vid 的环境正在 building / starting → 自动进入「搭建中」界面并接管播报，
+ *     不管这个搭建是从这台浏览器发起的还是后端/别的会话发起的；
+ *  2. 状态一变就播报：搭建中 → 启动中 → 运行中 / 构建失败 / 已放弃。 */
+let bgTimer = null
+
+function startBgWatch() {
+  if (bgTimer) return
   let last = ''
-  pollTimer = setInterval(async () => {
+  bgTimer = setInterval(async () => {
     try {
       const r = await listEnvs()
-      const e = (r.items || []).find((x) => (x.vulns || []).includes(targetVid))
+      items.value = r.items || []
+      root.value = r.root || ''
+      docker.value = !!r.docker
+      dockerEnabled.value = !!r.docker_enabled
+      const target = vid.value.trim()
+      if (!target) return
+      const e = (r.items || []).find((x) => (x.vulns || []).includes(target))
       if (!e) return
+      // 后台有搭建任务 → 前台自动响应：面板打开、按钮换成「拒绝，停止」
+      if ((e.status === 'building' || e.status === 'starting') && !building.value) {
+        building.value = true
+        aiSay('sys', `检测到 ${target} 的环境正在后台搭建/启动，已自动接管：进度照常播报，` +
+          '点「拒绝，停止」可立即终止全部任务。')
+      }
       const sig = `${e.id}:${e.status}`
       if (sig !== last) {
-        const text = { building: '规划完成，正在拉取程序本体/构建镜像…',
-                       starting: '容器已创建，等服务真正监听…',
-                       ready: `就绪：${e.component || ''} ${e.version || ''}`,
-                       running: '服务已监听，能打了',
-                       failed: '构建失败', abandoned: '已放弃' }[e.status] || e.status
-        if (last) aiSay('sys', `〔进度〕${text}`)
+        if (last) {
+          const text = { building: '正在拉取程序本体/构建镜像…',
+                         starting: '容器已创建，等服务真正监听…',
+                         ready: `就绪：${e.component || ''} ${e.version || ''}`,
+                         running: `服务已监听，能打了${e.target_url ? `，靶站 ${e.target_url}` : ''}`,
+                         failed: `构建失败${e.reason ? '：' + e.reason : ''}`,
+                         abandoned: `已放弃${e.reason ? '：' + e.reason : ''}` }[e.status] || e.status
+          aiSay('sys', `〔进度〕${text}`)
+        }
         last = sig
       }
     } catch { /* 轮询失败不打扰用户 */ }
-  }, 2000)
-}
-
-function stopPoll() {
-  if (pollTimer) { clearInterval(pollTimer); pollTimer = null }
-}
-
-/** 自动启动后接着盯 starting → running，健康检查一过就播"能打了"。 */
-async function awaitRunning(targetVid) {
-  for (let i = 0; i < 30; i++) {
-    await new Promise((res) => setTimeout(res, 2000))
-    try {
-      const r = await listEnvs()
-      const e = (r.items || []).find((x) => (x.vulns || []).includes(targetVid))
-      if (!e) break
-      if (e.status === 'running') {
-        aiSay('sys', `〔进度〕服务已监听，能打了。靶站 ${e.target_url} 可以打开手工验证。`)
-        break
-      }
-      if (e.status === 'failed' || e.status === 'abandoned') {
-        aiSay('sys', `〔进度〕${statusText(e.status)}：${e.reason || ''}`)
-        break
-      }
-    } catch { break }
-  }
-  stopPoll()
+  }, 3000)
 }
 
 // ── 站点预览 ──────────────────────────────────────────────
@@ -533,14 +535,45 @@ function stepsView(steps) {
   }))
 }
 
+// 聊天框里的审批指令：待审批方案挂着或搭建进行中时，「同意/拒绝」这类话直接执行，
+// 不用非得去点按钮。拒绝是最高优先级，先于同意判断。
+const APPROVE_RE = /(同意|允许|批准|确认|可以|开搭|开始搭建|继续|就这么搭|搭吧)/
+const REJECT_RE = /(拒绝|取消|停止|暂停|不要搭|别搭|不搭|停下)/
+
+/** 当前漏洞有没有待审批的方案或进行中的搭建。 */
+function hasPendingPlan() {
+  const target = vid.value.trim()
+  const e = target ? items.value.find((x) => (x.vulns || []).includes(target)) : null
+  return !!plan.value || !!resolveCtrl || buildInFlight ||
+    (e && (e.status === 'building' || e.status === 'starting'))
+}
+
+/** 发 LLM 前先本地识别审批意图：命中就本地执行，不打扰模型。返回是否已处理。 */
+function chatApprove(t) {
+  if (!hasPendingPlan()) return false
+  if (REJECT_RE.test(t)) {
+    aiSay('sys', '已按你的指令执行：拒绝，停止本次环境搭建的全部任务。')
+    rejectAll()
+    return true
+  }
+  if (APPROVE_RE.test(t) && plan.value) {
+    aiSay('sys', '已按你的指令执行：同意，按当前方案开始搭建。')
+    doBuild()
+    return true
+  }
+  return false
+}
+
 /** 发一句话给 agent。会话懒创建，历史存服务端，切页面回来还在。
- *  流式版：模型吐字实时上屏（〔思考〕/〔答复〕），工具每执行一步就追加一行，
- *  收到 done 后用最终答复替换成干净版本。不再「转圈几十秒整段蹦出来」。 */
+ *  流式版：模型吐字实时上屏（〔思考〕/〔答复〕），每次工具调用收进折叠的
+ *  「执行了 N 步操作」里实时更新，收到 done 后用最终答复替换成干净版本。
+ *  待审批方案挂着或搭建进行中时，聊天框里说「同意/拒绝」就直接执行。 */
 async function aiAsk(text = '') {
   const t = String(text || aiDraft.value || '').trim()
   if (!t || aiPending.value) return
   aiDraft.value = ''
   aiSay('user', t)
+  if (chatApprove(t)) return
   aiPending.value = true
   try {
     if (!aiSid.value) {
@@ -554,6 +587,7 @@ async function aiAsk(text = '') {
     const live = aiMsgs.value[aiMsgs.value.length - 1]
     let lastField = ''
     let streamErr = ''
+    const liveSteps = []
     await agentChatStream([{ role: 'user', content: t }], ui, aiSid.value, {}, (ev) => {
       if (ev.type === 'text') {
         if (ev.reset) {
@@ -570,7 +604,10 @@ async function aiAsk(text = '') {
         live.content += ev.text
         nextTick(() => aiBox.value?.scrollTo({ top: aiBox.value.scrollHeight }))
       } else if (ev.type === 'step') {
-        live.content += `\n〔已执行〕${ev.step.tool}：${ev.step.out}`
+        // 工具调用不再往正文里追加〔已执行〕行：收进折叠面板实时更新，
+        // 展开能看到每次调了什么工具、传了什么参数、回了什么
+        liveSteps.push(ev.step)
+        live.steps = stepsView(liveSteps)
         lastField = ''                      // 下一轮思考再进来时重新打标记
         nextTick(() => aiBox.value?.scrollTo({ top: aiBox.value.scrollHeight }))
       } else if (ev.type === 'done') {
@@ -701,22 +738,11 @@ function autoBuildFromQuery() {
   router.replace({ query: { ...route.query, vid: undefined } })
 }
 
-/** 刷新页面后接管还在进行的搭建：列表里有 building 的环境就把轮询和播报接回去。 */
-async function recoverBuilding() {
-  try {
-    const r = await listEnvs()
-    const building = (r.items || []).find((e) => e.status === 'building')
-    if (!building) return
-    aiSay('sys', `检测到进行中的搭建（${building.component || building.id}，` +
-      `关联 ${(building.vulns || []).join(', ') || '未知漏洞'}），已接回播报，进度我会继续跟。`)
-    startPoll((building.vulns || [])[0] || building.id)
-  } catch { /* 列表都拿不到就算了，别阻塞首屏 */ }
-}
-
 onMounted(() => {
   load()
   autoBuildFromQuery()
-  recoverBuilding()
+  // 常驻监视：刷新页面/切回来都能发现后台正在进行的搭建并自动接管播报
+  startBgWatch()
 })
 watch(() => route.query.vid, (nv, ov) => {
   if (nv && nv !== ov && route.path === '/envs') autoBuildFromQuery()
