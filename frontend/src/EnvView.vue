@@ -80,8 +80,8 @@
         <textarea v-model="aiDraft" rows="2" :disabled="aiPending"
                   placeholder="输入想做的事，Enter 发送，Shift+Enter 换行"
                   @keydown.enter.exact.prevent="aiSend"></textarea>
-        <button class="send" :disabled="aiPending || !aiDraft.trim()" @click="aiSend">
-          {{ aiPending ? '…' : '发送' }}
+        <button class="send" :disabled="!aiPending && !aiDraft.trim()" @click="aiPending ? aiStop() : aiSend()">
+          {{ aiPending ? '暂停' : '发送' }}
         </button>
       </div>
 
@@ -457,6 +457,8 @@ const aiPending = ref(false)
 const aiSid = ref('')
 const aiBox = ref(null)
 const aiSent = ref(null)      // 本轮真正发给模型的请求体（后端回带）
+// 对话流的取消器：发送按钮在对话进行中变成暂停按钮，点了立刻掐断流
+let aiCtrl = null
 
 // 欢迎语里的示例，点一下就直接发给 agent
 const aiExamples = [
@@ -588,6 +590,8 @@ async function aiAsk(text = '') {
     let lastField = ''
     let streamErr = ''
     const liveSteps = []
+    const ctrl = new AbortController()
+    aiCtrl = ctrl
     await agentChatStream([{ role: 'user', content: t }], ui, aiSid.value, {}, (ev) => {
       if (ev.type === 'text') {
         if (ev.reset) {
@@ -620,11 +624,15 @@ async function aiAsk(text = '') {
       } else if (ev.type === 'error') {
         streamErr = ev.message
       }
-    })
+    }, { signal: ctrl.signal })
     if (streamErr) aiSay('fail', `出错了：${streamErr}`)
   } catch (e) {
-    aiSay('fail', `出错了：${e.message}`)
+    // 用户点的「暂停」掐断的不算出错，别拿红色报错吓人
+    if (!aiCtrl || !aiCtrl.signal.aborted) {
+      aiSay('fail', `出错了：${e.message}`)
+    }
   } finally {
+    aiCtrl = null
     aiPending.value = false
   }
 }
@@ -632,6 +640,16 @@ async function aiAsk(text = '') {
 /** 发送按钮 / 回车都走这里。 */
 function aiSend() {
   aiAsk()
+}
+
+/** 暂停对话：立刻掐断流式连接，已上屏的内容保留。 */
+function aiStop() {
+  if (aiCtrl) {
+    aiCtrl.abort('paused')
+    aiCtrl = null
+    aiSay('sys', '已暂停对话。想继续就再发一句。')
+  }
+  aiPending.value = false
 }
 
 /** 清空这个框（服务端的会话消息也一起清，免得 agent 还记着上一轮）。 */

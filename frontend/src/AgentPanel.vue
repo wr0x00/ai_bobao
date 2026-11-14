@@ -71,6 +71,7 @@
               </div>
             </details>
           </div>
+          <div v-else-if="m.role === 'sys'" class="row sysnote">{{ m.content }}</div>
           <div v-else class="row fail">{{ m.error }}</div>
         </template>
 
@@ -81,8 +82,8 @@
         <textarea v-model="draft" rows="2" :disabled="pending"
                   placeholder="输入想做的事，Enter 发送，Shift+Enter 换行"
                   @keydown.enter.exact.prevent="onEnter"></textarea>
-        <button class="send" :disabled="pending || !draft.trim()" @click="onEnter">
-          {{ pending ? '…' : '发送' }}
+        <button class="send" :disabled="!pending && !draft.trim()" @click="pending ? stop() : onEnter">
+          {{ pending ? '暂停' : '发送' }}
         </button>
       </div>
     </div>
@@ -170,6 +171,8 @@ const curId = ref('')
 const msgs = ref([])
 const draft = ref('')
 const pending = ref(false)
+// 对话流的取消器：发送按钮在对话进行中变成暂停按钮，点了立刻掐断流
+let chatCtrl = null
 const box = ref(null)
 const renaming = ref('')
 const renameText = ref('')
@@ -457,6 +460,8 @@ async function ask(text) {
         let lastField = ''
         let streamErr = ''
         const liveSteps = []
+        const ctrl = new AbortController()
+        chatCtrl = ctrl
         await agentChatStream([{ role: 'user', content: body }], uiContext(), curId.value,
             chatOpts(), (ev) => {
             if (ev.type === 'text') {
@@ -484,14 +489,28 @@ async function ask(text) {
             } else if (ev.type === 'error') {
                 streamErr = ev.message
             }
-        })
+        }, { signal: ctrl.signal })
         if (streamErr) msgs.value.push({ role: 'fail', error: streamErr })
         await refreshList()
     } catch (e) {
-        msgs.value.push({ role: 'fail', error: e.message })
+        // 用户点的「暂停」掐断的不算出错，别拿红色报错吓人
+        if (!chatCtrl || !chatCtrl.signal.aborted) {
+            msgs.value.push({ role: 'fail', error: e.message })
+        }
     } finally {
+        chatCtrl = null
         pending.value = false
     }
+}
+
+/** 暂停对话：立刻掐断流式连接，已上屏的内容保留。 */
+function stop() {
+    if (chatCtrl) {
+        chatCtrl.abort('paused')
+        chatCtrl = null
+        msgs.value.push({ role: 'sys', content: '已暂停对话。想继续就再发一句。' })
+    }
+    pending.value = false
 }
 
 /** 导出的 JSON 走 blob 下载：接口要求自定义头，不能用裸链接。 */
@@ -576,6 +595,7 @@ button { border: 0; border-radius: 0; cursor: pointer; font-size: 12.5px; }
                   white-space: pre-wrap; word-break: break-word; }
 .row.fail { align-self: stretch; max-width: 100%; color: #f87171; background: #2a1215;
             border: 1px solid #7f1d1d; border-radius: 8px; padding: 8px 12px; font-size: 12.5px; }
+.row.sysnote { align-self: stretch; max-width: 100%; color: #8b93a1; font-size: 12.5px; }
 .wait { color: #8b93a1; font-size: 12.5px; }
 
 .steps { background: #0c0e12; border: 1px dashed #262b36; border-radius: 8px;

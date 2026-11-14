@@ -377,11 +377,15 @@ def test_cancel_build_highest_priority(monkeypatch):
     assert r.get("canceled") is True
     assert r["env"]["status"] == lab_env.STATUS_FAILED
     assert r["env"]["reason"] == "用户取消"
+    eid = r["env"]["id"]
     # build 结束后取消事件要被注销，别留着下次误触
     assert vid not in lab_env._CANCEL
-    # 对没有活动任务的漏洞再点一次取消，也要安全返回
+    # 对没有活动任务的漏洞再点一次取消：半成品缓存（拉了一半的目录）一并清掉
+    assert lab_env._env_dir(eid).exists()
     r2 = lab_env.cancel_build(vid)
-    assert r2["ok"] is True and r2["canceled"] is False
+    assert r2["ok"] is True and r2["canceled"] is False and r2["cleaned"] == [eid]
+    assert not lab_env._env_dir(eid).exists()
+    assert store.get_vuln(vid)["env_id"] == ""
 
 
 def test_start_docker_env(monkeypatch):

@@ -274,8 +274,10 @@ export const agentChat = (messages, ui = "", sessionId = '', opts = {}) =>
 //   {type:'step', step}                           工具执行完一步
 //   {type:'done', reply, steps, sent}             收尾（跟 agentChat 的返回值同构）
 //   {type:'error', message}                       失败原因
-// 其余 opts 语义与 agentChat 完全一致。
-export const agentChatStream = (messages, ui = '', sessionId = '', opts = {}, onEvent = () => {}) =>
+// 其余 opts 语义与 agentChatStream 完全一致；options 传给 fetch，
+// 可放 AbortController 的 signal——暂停按钮要能真的掐断流。
+export const agentChatStream = (messages, ui = '', sessionId = '', opts = {},
+        onEvent = () => {}, options = {}) =>
     streamPost('/api/agent/chat/stream', {
         messages,
         ui,
@@ -288,7 +290,7 @@ export const agentChatStream = (messages, ui = '', sessionId = '', opts = {}, on
             null : opts.temperature,
         max_tokens: opts.max_tokens === undefined || opts.max_tokens === null ?
             null : opts.max_tokens,
-    }, onEvent)
+    }, onEvent, options)
 
 // resolveEnv 的流式版：方案字段一边生成一边播报
 //   {type:'field', field, text}  某个字段已生成的完整值

@@ -92,6 +92,9 @@ _build_lock = threading.Lock()
 # 把事件一 set，正在跑的 docker pull / git clone / docker build 子进程立刻被杀，
 # 各阶段间的检查点也会让 build() 不再往下走。用户点「拒绝，停止」是最高优先级。
 _CANCEL: dict[str, threading.Event] = {}
+# 取消后 build() 退出时 set，cancel_build() 等它确认 build 线程真的停了，
+# 再去清理半成品缓存（拉了一半的源码/固件目录、自建镜像）。
+_CANCEL_DONE: dict[str, threading.Event] = {}
 
 
 def _canceled_result(d: Path, plan: dict, eid: str, meta: dict, vid: str) -> dict:
@@ -807,6 +810,7 @@ def build(vid: str, llm=None, plan: dict | None = None) -> dict:
         raise EnvError("漏洞不存在", 404)
 
     ev = _CANCEL.setdefault(vid, threading.Event())
+    _CANCEL_DONE.setdefault(vid, threading.Event())
     if not _build_lock.acquire(blocking=False):
         raise EnvError("已有环境在构建中，稍后再试", 429)
     try:
@@ -933,37 +937,72 @@ def build(vid: str, llm=None, plan: dict | None = None) -> dict:
                 "abandoned": unavailable, "auto_start": started_msg}
     finally:
         _CANCEL.pop(vid, None)
+        done = _CANCEL_DONE.pop(vid, None)
+        if done:
+            done.set()
         _build_lock.release()
 
 
 def cancel_build(vid: str) -> dict:
-    """最高优先级取消：立即终止该漏洞本次环境搭建的一切进行中任务。
+    """最高优先级取消：立即终止该漏洞本次环境搭建的一切进行中任务，并清缓存。
 
     1. set 取消事件 → build() 里的 docker pull / git clone / docker build
        子进程在 0.5 秒内被杀，各检查点让后续步骤不再执行；
-    2. 环境处于「构建中」→ 直接记失败（用户取消）；
-    3. 环境已在运行/启动中 → 立即停掉容器。
+    2. 等 build 线程退出（杀子进程通常不到 1 秒，LLM 规划阶段最多等 10 秒，
+       超时就不等了，build 的检查点自己会把构建标成用户取消）；
+    3. 「构建中」或已被检查点标成「用户取消」的环境 → 半成品缓存一并清掉
+       （拉了一半的源码/固件目录、自建镜像）；
+    4. 环境已在运行/启动中 → 立即停掉容器。
     """
     ev = _CANCEL.get(vid)
     if ev:
         ev.set()
+        done = _CANCEL_DONE.get(vid)
+        if done:
+            done.wait(timeout=10)
     stopped: list[str] = []
+    cleaned: list[str] = []
     v = store.get_vuln(vid)
     eid = str((v or {}).get("env_id") or "")
     if eid and _EID_RE.match(eid):
-        m = _read_meta(_env_dir(eid))
+        d = _env_dir(eid)
+        m = _read_meta(d)
         st = str(m.get("status") or "")
         if st == STATUS_BUILDING:
-            _write_meta(_env_dir(eid), {**m, "status": STATUS_FAILED,
-                                        "reason": "用户取消", "log": "用户取消"})
-            store.patch_meta(vid, {"env_status": STATUS_FAILED})
+            _cleanup_partial(d, eid, m, vid)
+            cleaned.append(eid)
+        elif st == STATUS_FAILED and str(m.get("reason") or "") == "用户取消":
+            # build 的检查点已经把取消写进 meta：半成品资产也一并清掉
+            _cleanup_partial(d, eid, m, vid)
+            cleaned.append(eid)
         elif st in (STATUS_RUNNING, STATUS_STARTING):
             try:
                 stop_env(eid)
                 stopped.append(eid)
             except EnvError:
                 pass
-    return {"ok": True, "canceled": bool(ev), "stopped": stopped}
+    return {"ok": True, "canceled": bool(ev), "stopped": stopped, "cleaned": cleaned}
+
+
+def _cleanup_partial(d: Path, eid: str, meta: dict, vid: str) -> None:
+    """清掉搭建一半的环境缓存：目录连同拉了一半的源码/固件一起删，自建镜像也删。
+
+    环境是多漏洞共享的就不删目录（别的漏洞还指着它），只把状态记成失败；
+    本漏洞的 env_id 关联一律解除，别留着指向一个没了的环境。
+    """
+    store.patch_meta(vid, {"env_id": "", "env_status": ""})
+    others = [x for x in (meta.get("vulns") or []) if x != vid]
+    if others:
+        _write_meta(d, {**meta, "status": STATUS_FAILED, "reason": "用户取消",
+                        "log": "用户取消"})
+        for other in others:
+            store.patch_meta(str(other), {"env_status": STATUS_FAILED})
+        logger.info("环境 %s 为多漏洞共享，保留目录，仅标记取消", eid)
+        return
+    if str(meta.get("mode") or "") == "build":
+        _run(["docker", "rmi", "-f", _built_tag(eid)], timeout=120)
+    _rmtree(d)
+    logger.info("已清理未完成的环境缓存 %s", eid)
 
 
 def list_envs() -> dict:
