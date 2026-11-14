@@ -126,7 +126,7 @@ Click "Build Environment" on a vulnerability detail page and you land on `/envs`
 
 ![Reproduction environment: automated build + PoC verification + update-PoC loop](image6.png)
 
-The card shows a **clickable target URL** (e.g. `http://127.0.0.1:9091`); "Preview" embeds the live site right in the card for manual verification. The AI panel pinned to the lower-left narrates every step and takes free-form commands too ("build a reproduction env for CVE-2024-xxxx", "fire the PoC", "why did it fail?").
+The card shows a **clickable target URL** (e.g. `http://127.0.0.1:9091`); "Preview" embeds the live site right in the card for manual verification. The inline AI chat box right under the vulnerability-ID input narrates every step and takes free-form commands too ("build a reproduction env for CVE-2024-xxxx", "fire the PoC", "why did it fail?"), with the tool-call trail expandable under each reply.
 
 Security boundaries: **a plan is never executed without user approval**; every fetch URL passes the SSRF gateway; image names are regex-whitelisted; git/docker commands are always invoked as argument arrays without a shell; every field of the LLM's plan is normalized and validated before use; environments are fingerprint-deduplicated — one environment per component+version, shared across vulnerabilities.
 
@@ -210,7 +210,7 @@ frontend/
     OverviewPanel.vue Overview charts (component bar chart + source donut)
     TemplatesView.vue Template library
     SettingsView.vue  Online settings
-    EnvView.vue       Reproduction environments (list / target URL / site preview / update-PoC / pinned AI panel)
+    EnvView.vue       Reproduction environments (list / target URL / site preview / update-PoC / inline AI chat box)
   vite.config.js Build config: outDir points at ../backend/static
 ```
 

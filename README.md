@@ -118,7 +118,7 @@ curl localhost:8100/api/agent/export/vulns-20260101-120000-abcd.json  # 下载�
 
 ![复现环境：自动搭建 + 打 PoC 验证 + 更新 PoC 闭环](image6.png)
 
-页面上直接给出**可点击的靶站地址**（如 `http://127.0.0.1:9091`），点「预览」还能在卡片里内嵌打开站点，方便手工验证。左下角的固定 AI 框实时播报每一步进度，也可以直接对话指挥（「搭 CVE-2024-xxxx 的复现环境」「打 PoC 验证」「看看为什么失败了」）。
+页面上直接给出**可点击的靶站地址**（如 `http://127.0.0.1:9091`），点「预览」还能在卡片里内嵌打开站点，方便手工验证。漏洞 ID 输入框下方的内联 AI 对话框实时播报每一步进度，也可以直接对话指挥（「搭 CVE-2024-xxxx 的复现环境」「打 PoC 验证」「看看为什么失败了」），并展开显示每一步的工具调用轨迹。
 
 安全边界：**方案必须用户审批才开拉**；所有拉取地址过 SSRF 网关；镜像名走正则白名单；git/docker 命令一律参数数组调用不经 shell；LLM 方案逐字段收敛校验后才执行；环境指纹去重，同组件同版本只建一份、多漏洞共享。
 
@@ -178,7 +178,7 @@ flowchart TB
     U["👤 用户（浏览器）"] --> FE
 
     subgraph FE["🖥️ 前端 Vue 3 · 构建产物 backend/static"]
-      UI["漏洞列表 / 详情 / 图表 / 设置<br>EnvView 复现环境页（靶站地址 + 站点预览 + 更新 PoC）<br>右下角 AI 助手面板 / /envs 页左下角环境 AI 框"]
+      UI["漏洞列表 / 详情 / 图表 / 设置<br>EnvView 复现环境页（靶站地址 + 站点预览 + 更新 PoC）<br>右下角 AI 助手面板 / /envs 页漏洞 ID 下方内联 AI 对话框"]
     end
 
     FE -- "同源相对请求 /api/..." --> BE
@@ -280,7 +280,7 @@ frontend/
     OverviewPanel.vue 总览图表（组件条形图 + 来源环状图）
     TemplatesView.vue 模板库
     SettingsView.vue  在线设置
-    EnvView.vue       复现环境页（环境列表 / 靶站地址 / 站点预览 / 更新 PoC / 左下角 AI 框）
+    EnvView.vue       复现环境页（环境列表 / 靶站地址 / 站点预览 / 更新 PoC / 内联 AI 对话框）
   vite.config.js 构建配置：outDir 指向 ../backend/static
 ```
 

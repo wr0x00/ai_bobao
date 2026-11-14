@@ -209,10 +209,12 @@ def _t_list_envs(args: dict) -> dict:
         envs = lab_env.list_envs()
     except Exception as e:  # noqa: BLE001
         return {"ok": False, "error": f"读环境列表失败：{e}"}
+    # list_envs 返回的是 {"items": [...], "root": ..., "docker": ...}，环境在 items 里
+    items = (envs or {}).get("items") or []
     slim = [{"id": e["id"], "component": e["component"], "version": e["version"],
              "status": e["status"], "source": e["source"], "mode": e["mode"],
              "image": e["image"], "target_url": e["target_url"],
-             "vulns": e["vulns"], "reason": e["reason"][:120]} for e in envs]
+             "vulns": e["vulns"], "reason": e["reason"][:120]} for e in items]
     return {"ok": True, "count": len(slim), "envs": slim}
 
 

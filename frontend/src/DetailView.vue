@@ -244,8 +244,8 @@ async function gen() {
 
 /**
  * 按本条漏洞的「影响设备与型号」自动搭本地复现环境。
- * 搭建过程长（拉源码/构建镜像），跳到 /envs 页做：那边有固定的 AI 助手框，
- * 实时播报搭建进度，还能对话指挥。
+ * 搭建过程长（拉源码/构建镜像），跳到 /envs 页做：那边在漏洞 ID 输入框下面
+ * 就有内联的 AI 对话框，实时播报搭建进度，还能对话指挥。
  */
 function goBuildEnv() {
   router.push(`/envs?vid=${encodeURIComponent(v.value.id)}`)

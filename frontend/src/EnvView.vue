@@ -39,6 +39,58 @@
       </div>
     </div>
 
+    <!-- 内联 AI 对话框：就摆在漏洞 ID 输入框下面，不浮动、不压住环境卡片。
+         能力跟右下角那个 AI 助手一样：LLM 进度自动播报 + 对话输入 + 工具调用轨迹。 -->
+    <section class="aichat">
+      <header class="aichathd">
+        <b>AI 助手 · 环境搭建</b>
+        <span class="hint">LLM 每一步都会播出来，也可以直接吩咐我</span>
+        <span class="space"></span>
+        <button class="mini" :disabled="aiPending" @click="clearAi">清空</button>
+      </header>
+
+      <div ref="aiBox" class="aichatlist">
+        <div v-if="!aiMsgs.length" class="aichatwelcome">
+          <p>我就在这儿盯着环境搭建，LLM 的每一步都会播出来。也可以直接吩咐我：</p>
+          <button v-for="eg in aiExamples" :key="eg" class="aieg" @click="aiAsk(eg)">{{ eg }}</button>
+          <p class="acap">能做的事：出复现方案、搭建环境、打 PoC 验证、改写 PoC、列出/启动/停止环境。</p>
+        </div>
+
+        <template v-for="(m, i) in aiMsgs" :key="i">
+          <div v-if="m.role === 'user'" class="airow me">{{ m.content }}</div>
+          <div v-else-if="m.role === 'assistant' || m.role === 'ai'" class="airow ai">
+            <div class="aibubble">{{ m.content }}</div>
+            <details v-if="m.steps && m.steps.length" class="aisteps" :open="false">
+              <summary>执行了 {{ m.steps.length }} 步操作</summary>
+              <div v-for="(s, j) in m.steps" :key="j" class="astep" :class="{ bad: !s.ok }">
+                <code>{{ s.ok ? '✔' : '✘' }} {{ s.tool }}({{ s.argsText }})</code>
+                <span class="aout">{{ s.out }}</span>
+                <a v-if="s.file" href="#" @click.prevent="dl(s.file)">下载 {{ s.file }}</a>
+              </div>
+            </details>
+          </div>
+          <div v-else-if="m.role === 'fail'" class="airow fail">{{ m.content }}</div>
+          <div v-else class="airow sys">{{ m.content }}</div>
+        </template>
+
+        <div v-if="aiPending" class="airow ai wait">AI 正在处理，可能要几十秒…</div>
+      </div>
+
+      <div class="aichatfoot">
+        <textarea v-model="aiDraft" rows="2" :disabled="aiPending"
+                  placeholder="输入想做的事，Enter 发送，Shift+Enter 换行"
+                  @keydown.enter.exact.prevent="aiSend"></textarea>
+        <button class="send" :disabled="aiPending || !aiDraft.trim()" @click="aiSend">
+          {{ aiPending ? '…' : '发送' }}
+        </button>
+      </div>
+
+      <details v-if="aiSent" class="aisent">
+        <summary>本次实际发送</summary>
+        <pre>{{ aiSentText }}</pre>
+      </details>
+    </section>
+
     <div v-if="msg" class="msg">{{ msg }}</div>
     <div v-if="error" class="error">出错了：{{ error }}</div>
     <div v-else-if="!items.length" class="empty">
@@ -108,38 +160,6 @@
       </div>
     </div>
 
-    <!-- 左侧固定 AI 框：搭建进度自动播报 + 简易对话指挥 -->
-    <div v-if="aiOpen" class="aipanel">
-      <div class="aihead">
-        <b>AI 助手 · 环境搭建</b>
-        <span class="aisp"></span>
-        <button class="ai-x" title="收起" @click="aiOpen = false">—</button>
-      </div>
-      <div ref="aiBox" class="aibox">
-        <div v-if="!aiMsgs.length" class="aiempty">
-          我会在这里播报搭建进度。也可以直接指挥我，比如：<br />
-          <code>搭 CVE-2024-xxxx 的复现环境</code><br />
-          <code>打 PoC 验证</code><br />
-          <code>列出现在的环境</code>
-        </div>
-        <div v-for="(m, i) in aiMsgs" :key="i" class="aim" :data-r="m.role">
-          <div class="aitext">{{ m.content }}</div>
-          <div v-if="m.steps && m.steps.length" class="aisteps">
-            <span v-for="(s, j) in m.steps" :key="j" class="aistep" :data-ok="String(s.ok)">
-              {{ s.tool }}{{ s.argsText ? `(${s.argsText})` : '' }} {{ s.ok ? '✓' : '✗' }}
-            </span>
-          </div>
-        </div>
-      </div>
-      <div class="aiinput">
-        <input v-model="aiInput" :disabled="aiPending" placeholder="指挥助手…"
-               @keyup.enter="aiAsk" />
-        <button class="primary" :disabled="aiPending" @click="aiAsk">
-          {{ aiPending ? '…' : '发送' }}
-        </button>
-      </div>
-    </div>
-    <button v-else class="aifab" title="展开 AI 助手" @click="aiOpen = true">AI</button>
   </div>
 </template>
 
@@ -151,15 +171,15 @@
 // 环境按「组件+版本+来源」算指纹，同一份程序多条漏洞共用，所以放在这一页集中管。
 //
 // 本组件被 App.vue 的 <keep-alive include="EnvView"> 缓存：切页面时组件不卸载，
-// 进度轮询和 AI 框播报照常跑，回来时方案、消息、进行中的搭建全都在。
+// 进度轮询和 AI 对话框播报照常跑，回来时方案、消息、进行中的搭建全都在。
 // keep-alive 靠组件名匹配，所以必须有 defineOptions({ name: 'EnvView' })。
 
 defineOptions({ name: 'EnvView' })
 
 import { computed, nextTick, onMounted, ref, watch } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
-import { agentChat, buildEnv, createSession, delEnv, genPoc, getEnv, listEnvs,
-         resolveEnv, startEnv, stopEnv, verifyEnv } from './api'
+import { agentChat, buildEnv, clearSession, createSession, delEnv, downloadAgentExport,
+         genPoc, getEnv, listEnvs, resolveEnv, startEnv, stopEnv, verifyEnv } from './api'
 
 const route = useRoute()
 const router = useRouter()
@@ -270,7 +290,6 @@ function openBuild() {
 /** 把 LLM 的方案翻译成一句句人话，逐行播进 AI 框——用户不打开方案面板
  *  也能看清 LLM 判定了什么、打算从哪拿程序本体、要占多少磁盘。 */
 function planNarrate(p) {
-  aiOpen.value = true
   if (!p) { aiSay('ai', 'LLM 没返回有效方案。'); return }
   const src = { docker: 'Docker Hub 现成镜像', source: 'GitHub 源码仓库',
                 release: '官方发布包直链' }[p.source] || p.source
@@ -302,7 +321,6 @@ async function doResolve() {
   busy.value = true
   error.value = ''
   msg.value = ''
-  aiOpen.value = true
   aiSay('sys', `正在把漏洞 ${vid.value.trim()} 交给 LLM 规划复现方案（判断组件/版本、从哪拿程序本体、要占多少磁盘）…`)
   const ctrl = new AbortController()
   resolveCtrl = ctrl
@@ -402,16 +420,30 @@ async function doBuild() {
   }
 }
 
-// ── 左侧固定 AI 框：进度播报 + 简易对话 ─────────────────
-// 比右下角的全功能抽屉轻得多：没有会话栏、没有参数配置，
-// 只播报搭建进度 + 一个输入框让用户指挥（对话仍走 /api/agent/chat）。
-const aiOpen = ref(true)
+// ── 内联 AI 对话框：进度播报 + 对话指挥 ───────────────────
+// 原来挂在左下角做浮动框，会把左下角的环境卡片压住；现在改成页面流里的
+// 一个方框，就摆在漏洞 ID 输入框下面：LLM 每一步都往里播，也随时能直接指挥。
+// 没有会话栏、没有参数面板，只有播报 + 一个输入框；对话仍走 /api/agent/chat。
 const aiMsgs = ref([])
-const aiInput = ref('')
+const aiDraft = ref('')
 const aiPending = ref(false)
 const aiSid = ref('')
 const aiBox = ref(null)
+const aiSent = ref(null)      // 本轮真正发给模型的请求体（后端回带）
 let pollTimer = null
+
+// 欢迎语里的示例，点一下就直接发给 agent
+const aiExamples = [
+  '列出现在的环境',
+  '给当前漏洞出一份复现方案',
+  '帮我打一次 PoC 验证',
+]
+
+/** 本轮实际发送的请求体，右下角那块「本次实际发送」显示的内容。 */
+const aiSentText = computed(() => {
+  if (!aiSent.value) return ''
+  try { return JSON.stringify(aiSent.value, null, 2) } catch { return '（无法序列化）' }
+})
 
 /** 往框里塞一条消息并滚到底。 */
 function aiSay(role, content, steps) {
@@ -474,19 +506,19 @@ function togglePreview(e) {
   previewId.value = previewId.value === e.id ? '' : e.id
 }
 
-/** 工具轨迹压成一行行小片，只给个名字和成败，细节用户点右下角抽屉看。 */
+/** 工具轨迹的入参拼成一行人话，模板里直接显示。 */
 function stepsView(steps) {
   return (steps || []).map((s) => ({
     ...s,
-    argsText: Object.entries(s.args || {}).map(([k, v]) => `${k}=${v}`).join(', ').slice(0, 60),
+    argsText: Object.entries(s.args || {}).map(([k, v]) => `${k}=${v}`).join(', ').slice(0, 100),
   }))
 }
 
 /** 发一句话给 agent。会话懒创建，历史存服务端，切页面回来还在。 */
-async function aiAsk() {
-  const t = aiInput.value.trim()
+async function aiAsk(text = '') {
+  const t = String(text || aiDraft.value || '').trim()
   if (!t || aiPending.value) return
-  aiInput.value = ''
+  aiDraft.value = ''
   aiSay('user', t)
   aiPending.value = true
   try {
@@ -496,11 +528,36 @@ async function aiAsk() {
     }
     const ui = `本地复现环境页（/envs）${vid.value ? `，当前漏洞：${vid.value}` : ''}`
     const r = await agentChat([{ role: 'user', content: t }], ui, aiSid.value)
+    aiSent.value = r.sent || null
     aiSay('assistant', r.reply || '（空回复）', stepsView(r.steps))
   } catch (e) {
-    aiSay('assistant', `出错了：${e.message}`)
+    aiSay('fail', `出错了：${e.message}`)
   } finally {
     aiPending.value = false
+  }
+}
+
+/** 发送按钮 / 回车都走这里。 */
+function aiSend() {
+  aiAsk()
+}
+
+/** 清空这个框（服务端的会话消息也一起清，免得 agent 还记着上一轮）。 */
+async function clearAi() {
+  if (aiPending.value) return
+  aiMsgs.value = []
+  aiSent.value = null
+  if (aiSid.value) {
+    try { await clearSession(aiSid.value) } catch { /* 清不掉就算了 */ }
+  }
+}
+
+/** 导出的 JSON 走 blob 下载：接口要自定义头，裸链接带不上。 */
+async function dl(file) {
+  try {
+    await downloadAgentExport(file)
+  } catch (e) {
+    aiSay('fail', `下载失败：${e.message}`)
   }
 }
 
@@ -575,7 +632,6 @@ function autoBuildFromQuery() {
   if (!qvid) return
   vid.value = qvid
   building.value = true
-  aiOpen.value = true
   // 自动只做到「出方案」这一步：方案必须用户审批后才开拉
   doResolve().then(() => {
     if (plan.value && plan.value.available) {
@@ -596,7 +652,6 @@ async function recoverBuilding() {
     const r = await listEnvs()
     const building = (r.items || []).find((e) => e.status === 'building')
     if (!building) return
-    aiOpen.value = true
     aiSay('sys', `检测到进行中的搭建（${building.component || building.id}，` +
       `关联 ${(building.vulns || []).join(', ') || '未知漏洞'}），已接回播报，进度我会继续跟。`)
     startPoll((building.vulns || [])[0] || building.id)
@@ -694,41 +749,68 @@ input { background: #171a21; color: #e6e6e6; border: 1px solid #262b36; border-r
 .error { color: #f87171; margin: 12px 0; }
 .empty { color: #8b93a1; padding: 40px 0; text-align: center; }
 
-/* ── 左侧固定 AI 框 ── */
-.aipanel { position: fixed; left: 12px; bottom: 12px; width: 320px; max-height: 62vh;
-  display: flex; flex-direction: column; background: #101319;
-  border: 1px solid #262b36; border-radius: 10px; box-shadow: 8px 0 24px rgba(0, 0, 0, .35);
-  z-index: 55; }
-.aihead { display: flex; align-items: center; gap: 8px; padding: 9px 12px;
-  border-bottom: 1px solid #262b36; font-size: 13px; }
-.aihead b { color: #93c5fd; }
-.aisp { flex: 1; }
-.ai-x { border: none; background: none; color: #6b7280; padding: 0 4px; font-size: 14px;
-  cursor: pointer; }
-.ai-x:hover { color: #e6e6e6; }
-.aibox { flex: 1; overflow-y: auto; padding: 10px 12px; display: flex;
-  flex-direction: column; gap: 8px; }
-.aiempty { color: #6b7280; font-size: 12px; line-height: 1.9; }
-.aiempty code { background: #262b36; padding: 1px 5px; border-radius: 4px; color: #9ca3af; }
-.aim { font-size: 12.5px; line-height: 1.6; }
-.aim .aitext { white-space: pre-wrap; word-break: break-word; }
-.aim[data-r="user"] .aitext { background: #0c4a6e; color: #bae6fd; border-radius: 8px;
-  padding: 6px 9px; display: inline-block; }
-.aim[data-r="sys"] .aitext { color: #8b93a1; font-size: 12px; }
-.aim[data-r="sys"]::before { content: '▸ '; color: #4b5563; }
-.aisteps { display: flex; flex-wrap: wrap; gap: 4px; margin-top: 4px; }
-.aistep { font-size: 11px; background: #171a21; border: 1px solid #262b36; border-radius: 3px;
-  padding: 1px 6px; color: #9ca3af; font-family: ui-monospace, Consolas, monospace;
-  max-width: 100%; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-.aistep[data-ok="true"] { color: #86efac; border-color: #14532d; }
-.aistep[data-ok="false"] { color: #fca5a5; border-color: #7f1d1d; }
-.aiinput { display: flex; gap: 6px; padding: 9px 12px; border-top: 1px solid #262b36; }
-.aiinput input { flex: 1; min-width: 0; }
-.aiinput button { padding: 6px 11px; }
-.aifab { position: fixed; left: 12px; bottom: 12px; width: 44px; height: 44px;
-  border-radius: 50%; background: #0ea5e9; color: #fff; border: none; font-weight: 700;
-  z-index: 55; cursor: pointer; }
-.aifab:hover { background: #38bdf8; }
+/* ── 内联 AI 对话框（跟在漏洞 ID 输入框下面） ── */
+.aichat { background: #101319; border: 1px solid #262b36; border-radius: 10px;
+  margin-bottom: 14px; overflow: hidden; }
+.aichathd { display: flex; align-items: center; gap: 10px; padding: 10px 14px;
+  border-bottom: 1px solid #262b36; }
+.aichathd b { font-size: 13.5px; color: #93c5fd; }
+.aichathd .hint { color: #6b7280; font-size: 12px; }
+.aichathd .space { flex: 1; }
+.aichathd button.mini { padding: 3px 10px; font-size: 12px; }
+
+.aichatlist { max-height: 460px; overflow-y: auto; padding: 12px 14px;
+  display: flex; flex-direction: column; gap: 10px; }
+.aichatwelcome { color: #8b93a1; font-size: 13px; line-height: 1.7;
+  display: flex; flex-direction: column; gap: 8px; align-items: flex-start; }
+.aichatwelcome p { margin: 0; }
+.aieg { background: #171a21; border: 1px solid #1e4964; color: #7dd3fc;
+  padding: 6px 12px; text-align: left; font-size: 12.5px; }
+.aieg:hover { border-color: #38bdf8; color: #bae6fd; }
+.acap { color: #6b7280; font-size: 12px; }
+
+.airow { max-width: 92%; font-size: 13px; line-height: 1.65;
+  white-space: pre-wrap; word-break: break-word; }
+.airow.me { align-self: flex-end; background: #0ea5e9; color: #f1f5f9;
+  border-radius: 10px 10px 2px 10px; padding: 8px 12px; }
+.airow.ai { align-self: flex-start; display: flex; flex-direction: column;
+  gap: 6px; max-width: 100%; }
+.aibubble { background: #171a21; border: 1px solid #262b36; color: #e6e6e6;
+  border-radius: 10px 10px 10px 2px; padding: 8px 12px; }
+.airow.sys { align-self: stretch; max-width: 100%; color: #8b93a1; font-size: 12.5px; }
+.airow.sys::before { content: '▸ '; color: #4b5563; }
+.airow.fail { align-self: stretch; max-width: 100%; color: #f87171; background: #2a1215;
+  border: 1px solid #7f1d1d; border-radius: 8px; padding: 8px 12px; font-size: 12.5px; }
+.airow.wait { color: #8b93a1; font-size: 12.5px; }
+
+/* 工具调用轨迹：折叠起来是一行摘要，展开看工具名、入参和输出 */
+.aisteps { background: #0c0e12; border: 1px dashed #262b36; border-radius: 8px;
+  padding: 6px 10px; font-size: 12px; color: #8b93a1; max-width: 100%; }
+.aisteps summary { cursor: pointer; color: #6b7280; }
+.aisteps .astep { display: flex; flex-wrap: wrap; gap: 4px 8px; padding: 3px 0;
+  align-items: baseline; }
+.aisteps code { font-family: Consolas, monospace; font-size: 11.5px; color: #93c5fd;
+  word-break: break-all; }
+.aisteps .astep.bad code { color: #f87171; }
+.aisteps .aout { color: #6b7280; }
+.aisteps a { font-size: 11.5px; }
+
+.aichatfoot { display: flex; align-items: flex-end; gap: 8px; padding: 10px 14px;
+  border-top: 1px solid #262b36; }
+.aichatfoot textarea { flex: 1; resize: none; background: #171a21; color: #e6e6e6;
+  border: 1px solid #262b36; border-radius: 8px; padding: 8px 10px;
+  font-size: 13px; font-family: inherit; outline: none; }
+.aichatfoot textarea:focus { border-color: #3b82f6; }
+.aichatfoot textarea::placeholder { color: #6b7280; }
+.aichatfoot .send { background: #0ea5e9; color: #fff; border: none; padding: 8px 14px; }
+.aichatfoot .send:hover { background: #38bdf8; }
+.aichatfoot .send:disabled { background: #374151; color: #cbd5e1; cursor: not-allowed; }
+
+.aisent { padding: 0 14px 12px; }
+.aisent summary { cursor: pointer; color: #6b7280; font-size: 11.5px; }
+.aisent pre { margin: 6px 0 0; background: #0c0e12; border: 1px solid #262b36;
+  color: #93c5fd; font-family: Consolas, monospace; font-size: 11px; line-height: 1.55;
+  padding: 8px; max-height: 200px; overflow: auto; white-space: pre-wrap; word-break: break-all; }
 
 /* 中间态标签色：building 橙黄（在拉东西）、starting 蓝（容器起了服务还没监听） */
 .tag[data-st="building"] { background: #3b2f0b; color: #fde68a; }

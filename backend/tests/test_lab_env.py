@@ -5,6 +5,7 @@
 """
 import pytest
 
+import agent
 import config
 import lab_env
 import security
@@ -339,6 +340,20 @@ def test_get_env_404():
     with pytest.raises(lab_env.EnvError) as e:
         lab_env.get_env("0123456789ab")
     assert e.value.status == 404
+
+
+def test_agent_list_envs_tool_reads_items(monkeypatch):
+    """agent 的 list_envs 工具：环境在 list_envs()["items"] 里，别把 dict 当 list 迭代。"""
+    vid = _make_vuln()
+    monkeypatch.setattr(lab_env, "_pull_docker", lambda image, timeout: (True, "pulled"))
+    llm = FakeLLM({"component": "Tomcat", "version": "9.0", "source": "docker",
+                    "image": "tomcat:9.0", "available": True})
+    lab_env.build(vid, llm=llm)
+
+    r = agent._t_list_envs({})
+    assert r["ok"] is True
+    assert r["count"] == 1
+    assert r["envs"][0]["component"] == "Tomcat"
 
 
 # ── 启动 / 停止 ───────────────────────────────────────────
