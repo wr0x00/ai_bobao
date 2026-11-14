@@ -13,6 +13,7 @@ import json
 import logging
 import time
 import urllib.error
+from collections.abc import Iterator
 
 import config
 import security
@@ -29,6 +30,9 @@ MAX_REPLY = 4 * 1024 * 1024      # 模型回复上限 4MB
 # 瞬时错误：服务商限流/过载/网关抖动，等一两秒重试通常就过了。
 # 401/404 这类确定性错误不在列，第一次就抛，别白等。
 _RETRY_CODES = frozenset({429, 500, 502, 503, 504})
+
+# 最多试几次（含首次）。抖动重试用这个数，流式和非流式保持一致。
+_RETRIES = 3
 
 
 class LLM:
@@ -56,7 +60,7 @@ class LLM:
         免得网关挂住时让人在界面上干等十分钟。
         """
         err: Exception | None = None
-        for attempt in range(3):
+        for attempt in range(_RETRIES):
             if attempt:
                 time.sleep(2 * attempt)
             try:
@@ -106,11 +110,14 @@ class LLM:
 
     def chat_messages_full(self, messages: list[dict],
                            temperature: float | None = None,
-                           max_tokens: int | None = None) -> tuple[str, dict]:
+                           max_tokens: int | None = None,
+                           json_mode: bool = True) -> tuple[str, dict]:
         """多轮对话版，同时回传「实际发出去的请求体」，方便前端展示。
 
         temperature 为 None 就不带这个字段，max_tokens 不是正整数也不带，
         跟不传时用的是模型端的同一套默认值。
+
+        json_mode=False 时不带 response_format，用于纯文本对话。
         """
         endpoint = f"{self.base}/v1/chat/completions"
         security.check_url(endpoint)
@@ -120,8 +127,9 @@ class LLM:
             # 复制一份列表：调用方后面还会往原 messages 里追加内容，
             # 这里要留住"发出那一刻"的原样
             "messages": list(messages),
-            "response_format": {"type": "json_object"},
         }
+        if json_mode:
+            payload["response_format"] = {"type": "json_object"}
         if temperature is not None:
             payload["temperature"] = temperature
         if isinstance(max_tokens, int) and max_tokens > 0:
@@ -131,11 +139,182 @@ class LLM:
         raw = self._post_chat(endpoint, body)
         return str(json.loads(raw)["choices"][0]["message"]["content"] or ""), payload
 
+    def chat_stream(self, messages: list[dict],
+                    temperature: float | None = None,
+                    max_tokens: int | None = None,
+                    json_mode: bool = True,
+                    timeout: float | None = None,
+                    payload_out: dict | None = None) -> Iterator[str]:
+        """流式对话：模型吐一段就 yield 一段，不用等它把整段写完。
+
+        走 OpenAI 兼容的 SSE（text/event-stream）：响应里每行 "data: {...}"，
+        其中 choices[0].delta.content 就是这一小段增量文字，"data: [DONE]" 收尾。
+
+        json_mode=True 时照样要 response_format=json_object（agent 协议靠它
+        稳定输出 JSON）；关掉就是纯文本流。
+
+        payload_out 传个 dict 进来，请求发完后会填上「实际发出去的请求体」，
+        用法跟 chat_messages_full 的返回值一样，前端照着展示。
+
+        服务端不支持 stream 参数时会回 4xx，这种情况退回非流式一次拿整段，
+        再当成"一口气吐完的流"yield 出去——上层代码不用关心走的哪条路。
+
+        出错处理跟非流式不一样：已经吐过字的流不重试（重试会把内容重复一遍），
+        只有一个字都还没吐出来时才重试。
+        """
+        endpoint = f"{self.base}/v1/chat/completions"
+        security.check_url(endpoint)
+
+        payload: dict = {
+            "model": self.model,
+            "messages": list(messages),
+            "stream": True,
+        }
+        if json_mode:
+            payload["response_format"] = {"type": "json_object"}
+        if temperature is not None:
+            payload["temperature"] = temperature
+        if isinstance(max_tokens, int) and max_tokens > 0:
+            payload["max_tokens"] = max_tokens
+
+        if payload_out is not None:
+            payload_out.clear()
+            payload_out.update({k: v for k, v in payload.items() if k != "stream"})
+
+        body = json.dumps(payload).encode()
+
+        wait = timeout or config.get("llm", "timeout")
+        headers = {"Content-Type": "application/json",
+                   "User-Agent": _UA,
+                   "Authorization": f"Bearer {self.key}",
+                   "Accept": "text/event-stream"}
+
+        last_err: Exception | None = None
+        for attempt in range(_RETRIES):
+            if attempt:
+                time.sleep(2 * attempt)
+            got = False
+            try:
+                with security.open_stream(endpoint, timeout=wait, method="POST",
+                                          data=body, headers=headers) as r:
+                    ctype = (r.headers.get("Content-Type") or "").lower()
+                    if "text/event-stream" in ctype:
+                        # 正经 SSE：逐行拆 data: 帧，delta.content 是增量文字
+                        for raw_line in r:
+                            line = raw_line.decode("utf-8", "replace").strip()
+                            if not line or not line.startswith("data:"):
+                                continue
+                            chunk = line[5:].strip()
+                            if chunk == "[DONE]":
+                                return
+                            try:
+                                obj = json.loads(chunk)
+                            except ValueError:
+                                continue
+                            err = obj.get("error")
+                            if isinstance(err, dict):
+                                # 有的网关把业务错误（如积分不足）包成 SSE 帧下发，
+                                # HTTP 状态还是 200——不识别的话就是"静默吐空"
+                                raise RuntimeError(
+                                    f"模型返回错误：{err.get('message') or err}")
+                            for ch in obj.get("choices") or []:
+                                piece = (ch.get("delta") or {}).get("content")
+                                if piece:
+                                    got = True
+                                    yield str(piece)
+                    else:
+                        # 有的中转对 stream:true 不做处理，直接回一份完整 JSON。
+                        # 内容在 choices[0].message.content，当"一口气吐完的流"下发。
+                        raw_body = r.read(MAX_REPLY)
+                        try:
+                            obj = json.loads(raw_body)
+                        except ValueError:
+                            obj = {}
+                        err = obj.get("error")
+                        if isinstance(err, dict):
+                            raise RuntimeError(
+                                f"模型返回错误：{err.get('message') or err}")
+                        text = str(obj.get("choices", [{}])[0]
+                                   .get("message", {}).get("content") or "")
+                        if text:
+                            got = True
+                            yield text
+                return
+            except security.SecurityError as e:
+                msg = str(e)
+                if "HTTP 4" in msg:
+                    # 服务端多半不支持 stream 参数（有的中转会 400/404）。
+                    # 退回非流式把整段拿回来，效果上等于"一口气吐完的流"。
+                    logger.warning("LLM 流式被拒（%s），退回非流式", msg)
+                    text, _ = self.chat_messages_full(messages, temperature,
+                                                      max_tokens, json_mode)
+                    if text:
+                        yield text
+                    return
+                last_err = e
+            except (OSError, urllib.error.URLError) as e:
+                last_err = e
+            if got:
+                # 已经吐过内容了，再重试会把同一段话发两遍
+                raise RuntimeError(f"流式输出中断：{last_err}")
+            logger.warning("LLM 流式第 %s 次失败：%s", attempt + 1, last_err)
+        raise RuntimeError(f"LLM 流式请求失败：{last_err}")
+
     def ping(self) -> str:
         """连通性自检：让模型回一个 JSON 探针，验证地址/密钥/模型三项都对。"""
         r = self.chat("只返回 JSON，不要任何解释。",
                       '{"task": "connectivity check", "reply": "pong"}')
         return str(r.get("reply", "")) or "ok"
+
+
+def field_so_far(raw: str, field: str) -> str:
+    """半截 JSON 里把 field 字段的字符串值「到目前为止」的部分抠出来。
+
+    流式时模型一个字一个字往外吐，整段 JSON 还没闭合，json.loads 解不了。
+    这里不做完整解析，只做状态机扫描：找到 "field" 这个键，越过冒号，
+    从值的开头引号一路读到当前文本末尾（或值结束的引号），把已经吐出来的
+    部分还原出来。转义序列按 JSON 规则解开，没写完的尾部转义先不吐。
+    解析不动就返回空串，调用方只是少显示几个字，不影响最终结果。
+
+    agent（thought/final）和环境方案（component/reason 等）的实时展示都靠它。
+    """
+    i = raw.find(f'"{field}"')
+    if i < 0:
+        return ""
+    i += len(field) + 2
+    while i < len(raw) and (raw[i].isspace() or raw[i] == ":"):
+        i += 1
+    if i >= len(raw) or raw[i] != '"':
+        return ""
+    i += 1
+    out: list[str] = []
+    mapping = {'"': '"', "\\": "\\", "/": "/", "n": "\n", "t": "\t",
+               "r": "\r", "b": "\b", "f": "\f"}
+    while i < len(raw):
+        ch = raw[i]
+        if ch == "\\":
+            if i + 1 >= len(raw):       # 尾部转义没写完，等下一片
+                break
+            nxt = raw[i + 1]
+            if nxt in mapping:
+                out.append(mapping[nxt])
+                i += 2
+                continue
+            if nxt == "u":
+                if i + 6 > len(raw):    # \uXXXX 不完整，等下一片
+                    break
+                try:
+                    out.append(chr(int(raw[i + 2:i + 6], 16)))
+                except ValueError:
+                    pass
+                i += 6
+                continue
+            break                       # 不认识的转义，到此为止
+        if ch == '"':
+            break                       # 值结束
+        out.append(ch)
+        i += 1
+    return "".join(out)
 
 
 def get_llm() -> LLM:

@@ -46,7 +46,7 @@ import net
 import nuclei_sync
 import security
 import store
-from llm import get_llm
+from llm import field_so_far, get_llm
 
 logger = logging.getLogger("ai_bobao.lab_env")
 
@@ -59,10 +59,9 @@ MAX_OVERLAY = 4                   # 补充仓库最多几个
 MAX_SETUP = 12                    # 容器内准备命令最多几条
 MAX_CMD_LEN = 300                 # 单条命令最长多少字符
 
-# 「先看方案」是界面上的交互动作，用户在面板前等着：单次 LLM 调用最多等 60 秒。
-# 全局 llm.timeout 是 300 秒、底层还会重试两次，套上能拖到十分钟——网关挂住时
-# 用户只会觉得「点了没反应」，不如早点如实报失败。
-PLAN_TIMEOUT = 60
+# 「先看方案」不再单独设短超时：走全局 llm.timeout（默认 300 秒），并且
+# 新链路 plan_env_stream 是流式的——模型每生成一段就实时推给前端，
+# 用户从第一秒起就能看到方案在逐字成形，不存在「点了没反应」的干等。
 
 # 环境状态
 STATUS_READY = "ready"        # 已就绪，未启动
@@ -410,12 +409,8 @@ def _norm_plan(r: dict) -> dict:
     }
 
 
-def plan_env(vid: str, llm=None) -> dict:
-    """让 LLM 给出这个漏洞的复现环境方案。不落盘，纯预判。"""
-    v = store.get_vuln(vid)
-    if not v:
-        raise EnvError("漏洞不存在", 404)
-    llm = llm or get_llm()
+def _plan_brief(v: dict) -> str:
+    """给模型的漏洞摘要，plan_env / plan_env_stream 共用。"""
     brief = {
         "name": v.get("name", ""),
         "summary": str(v.get("summary") or "")[:300],
@@ -424,12 +419,73 @@ def plan_env(vid: str, llm=None) -> dict:
         "component": v.get("component", ""),
         "refs": list(v.get("refs") or [])[:5],
     }
+    return json.dumps(brief, ensure_ascii=False)
+
+
+def _plan_messages(v: dict) -> list[dict]:
+    return [{"role": "system", "content": _PLAN_SYS},
+            {"role": "user", "content": _plan_brief(v)}]
+
+
+def plan_env(vid: str, llm=None) -> dict:
+    """让 LLM 给出这个漏洞的复现环境方案。不落盘，纯预判。"""
+    v = store.get_vuln(vid)
+    if not v:
+        raise EnvError("漏洞不存在", 404)
+    llm = llm or get_llm()
     try:
-        r = llm.chat(_PLAN_SYS, json.dumps(brief, ensure_ascii=False),
-                     timeout=PLAN_TIMEOUT)
+        r = llm.chat(_PLAN_SYS, _plan_brief(v))
     except Exception as e:  # LLM 挂了就是给不出方案，如实说
         raise EnvError(f"LLM 不可用：{e}", 502) from e
     return _norm_plan(r if isinstance(r, dict) else {})
+
+
+# 流式方案里值得实时展示的字段：都是短文本，值一变就把完整值推给前端。
+# available 是布尔、setup/ports/port_map/overlay 是结构，不适合逐字播报，不列。
+_PLAN_STREAM_FIELDS = ("component", "version", "device", "source", "image",
+                       "repo", "ref", "release", "size_estimate", "reason")
+
+
+def plan_env_stream(vid: str, llm=None):
+    """plan_env 的流式版：方案一边生成一边 yield 出去。
+
+    yield 的事件（dict）：
+      {"type": "field", "field": 字段名, "text": 该字段已生成的完整值}
+      {"type": "done", "plan": 规范化后的完整方案}
+
+    模型按 _PLAN_SYS 约定的顺序逐字段写 JSON，这里用 llm.field_so_far
+    从半截 JSON 里实时抠字段值，前端能看到方案逐字成形，不用干等整段。
+    失败抛 EnvError（与 plan_env 一致）。
+    """
+    v = store.get_vuln(vid)
+    if not v:
+        raise EnvError("漏洞不存在", 404)
+    llm = llm or get_llm()
+
+    shown: dict[str, str] = {}
+    chunks: list[str] = []
+    try:
+        for piece in llm.chat_stream(_plan_messages(v), json_mode=True):
+            chunks.append(piece)
+            raw = "".join(chunks)
+            for f in _PLAN_STREAM_FIELDS:
+                val = field_so_far(raw, f)
+                if val and val != shown.get(f):
+                    shown[f] = val
+                    yield {"type": "field", "field": f, "text": val}
+    except EnvError:
+        raise
+    except Exception as e:  # LLM 挂了就是给不出方案，如实说
+        raise EnvError(f"LLM 不可用：{e}", 502) from e
+
+    raw = "".join(chunks)
+    try:
+        r = json.loads(raw)
+    except ValueError:
+        # 整段没闭合（连接中断之类）：拿流式过程中抠到的字段兜底拼方案，
+        # _norm_plan 会把缺的字段补成空值并做可用性收窄，不会带出脏数据
+        r = dict(shown)
+    yield {"type": "done", "plan": _norm_plan(r if isinstance(r, dict) else {})}
 
 
 # ── 指纹与共享 ────────────────────────────────────────────

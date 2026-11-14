@@ -139,6 +139,64 @@ export const saveSettings = (body) => post('/api/settings', body)
 
 export const testLlm = (llm) => post('/api/settings/test', { llm: llm || {} })
 
+/**
+ * 发一个流式写请求（SSE）。后端每生成一段就推一帧 `data: {json}\n\n`，
+ * onEvent 每帧被调一次——模型吐一个字就能上屏，不用等整轮结束。
+ *
+ * @param {string} url 请求地址
+ * @param {object} body 请求体
+ * @param {(ev: object) => void} onEvent 每帧回调
+ * @param {object} [options] 额外的 fetch 选项（比如 AbortController 的 signal）
+ * @returns {Promise<void>} 流走完（收到 done/error 帧或连接关闭）后 resolve
+ */
+export async function streamPost(url, body, onEvent, options = {}) {
+    const headers = { 'X-AI-BaoBao': '1', 'Content-Type': 'application/json' }
+    const t = await ensureToken()
+    if (t) headers['X-AI-BaoBao-Token'] = t
+
+    const r = await fetch(url, {
+        credentials: 'same-origin',
+        cache: 'no-store',
+        ...options,
+        method: 'POST',
+        headers,
+        body: JSON.stringify(body || {}),
+    })
+    if (!r.ok) {
+        let detail = ''
+        try { detail = (await r.json()).detail || '' } catch { /* 非 JSON 跳过 */ }
+        if (Array.isArray(detail)) {
+            detail = detail.map((d) => `${(d.loc || []).slice(1).join('.')}: ${d.msg}`).join('; ')
+        }
+        throw new Error(detail || `HTTP ${r.status}`)
+    }
+    if (!r.body) throw new Error('浏览器不支持流式读取')
+
+    const reader = r.body.getReader()
+    const decoder = new TextDecoder('utf-8')
+    let buf = ''
+    for (;;) {
+        const { done, value } = await reader.read()
+        if (done) break
+        buf += decoder.decode(value, { stream: true })
+            // 帧以空行分隔；最后一段可能不完整，留在缓冲区等下一块
+        let idx
+        while ((idx = buf.indexOf('\n\n')) >= 0) {
+            const frame = buf.slice(0, idx)
+            buf = buf.slice(idx + 2)
+            for (const line of frame.split('\n')) {
+                const s = line.trim()
+                if (!s.startsWith('data:')) continue
+                const payload = s.slice(5).trim()
+                if (!payload || payload === '[DONE]') continue
+                try {
+                    onEvent(JSON.parse(payload))
+                } catch { /* 半截 JSON，跳过这帧 */ }
+            }
+        }
+    }
+}
+
 // ── 漏洞源接入 ──────────────────────────────────────────
 export const listSources = () => req('/api/sources')
 
@@ -204,6 +262,34 @@ export const agentChat = (messages, ui = "", sessionId = '', opts = {}) =>
         max_tokens: opts.max_tokens === undefined || opts.max_tokens === null ?
             null : opts.max_tokens,
     })
+
+// agentChat 的流式版：走 /api/agent/chat/stream，onEvent 收到的事件有
+//   {type:'text', field:'thought'|'final', text}  增量文字（thought=思考，final=答复）
+//   {type:'step', step}                           工具执行完一步
+//   {type:'done', reply, steps, sent}             收尾（跟 agentChat 的返回值同构）
+//   {type:'error', message}                       失败原因
+// 其余 opts 语义与 agentChat 完全一致。
+export const agentChatStream = (messages, ui = '', sessionId = '', opts = {}, onEvent = () => {}) =>
+    streamPost('/api/agent/chat/stream', {
+        messages,
+        ui,
+        session_id: sessionId,
+        system_prompt: opts.system_prompt || '',
+        context_mode: opts.context_mode || 'compress',
+        context_rounds: opts.context_rounds === undefined ? 6 : opts.context_rounds,
+        history_chars: opts.history_chars === undefined ? 300 : opts.history_chars,
+        temperature: opts.temperature === undefined || opts.temperature === null ?
+            null : opts.temperature,
+        max_tokens: opts.max_tokens === undefined || opts.max_tokens === null ?
+            null : opts.max_tokens,
+    }, onEvent)
+
+// resolveEnv 的流式版：方案字段一边生成一边播报
+//   {type:'field', field, text}  某个字段已生成的完整值
+//   {type:'done', plan}          规范化后的完整方案（跟 resolveEnv 返回的 plan 同构）
+//   {type:'error', message}      失败原因
+export const resolveEnvStream = (vid, onEvent = () => {}, options = {}) =>
+    streamPost('/api/envs/resolve/stream', { vid }, onEvent, options)
 
 // ── AI Agent 会话历史 ───────────────────────────────────
 // 会话列表：id / 标题 / 时间 / 消息条数

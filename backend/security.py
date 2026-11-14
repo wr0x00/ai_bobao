@@ -23,6 +23,7 @@
 """
 from __future__ import annotations
 
+import contextlib
 import ipaddress
 import os
 import re
@@ -309,6 +310,63 @@ def _peer_ip(resp) -> str:
         return resp.fp.raw._sock.getpeername()[0]
     except Exception:  # noqa: BLE001 —— 不同 Python 版本/协议下结构不一样，取不到就算了
         return ""
+
+
+@contextlib.contextmanager
+def open_stream(
+    url: str,
+    timeout: float = 60.0,
+    headers: dict | None = None,
+    method: str = "GET",
+    data: bytes | None = None,
+    allow_private: bool | None = None,
+):
+    """open_url 的流式版本：只做校验和连接，把响应对象交给调用方自己读。
+
+    校验规则跟 open_url 完全一样（协议/域名/IP/重定向/对端复核），区别是
+    不一次性把响应体读进内存——SSE 这类"边生成边下发"的接口必须这样，
+    否则就只能等对方把整段写完才知道内容，实时性全没了。
+
+    timeout 是 socket 级的：多久没收到新数据才算超时，所以持续有数据的
+    长连接不会因为总时长超过它而被掐断。
+
+    用法：
+        with security.open_stream(url, ...) as resp:
+            for line in resp:
+                ...
+    """
+    target = check_url(url, allow_private)
+    if allow_private is None:
+        allow_private = allow_private_hosts()
+    req = urllib.request.Request(target, data=data, method=method.upper())
+    for k, v in (headers or {}).items():
+        req.add_header(k, v)
+    opener = urllib.request.build_opener(
+        urllib.request.HTTPSHandler(context=_ssl_context()),
+        _SafeRedirect(allow_private),
+    )
+    try:
+        r = opener.open(req, timeout=timeout)
+    except urllib.error.HTTPError as e:
+        detail = (e.reason or "").strip()
+        raise SecurityError(f"对方返回 HTTP {e.code}" + (f"（{detail}）" if detail else "")) from e
+    except urllib.error.URLError as e:
+        # socket 超时会包在 URLError 里，单独拆出来说人话
+        if isinstance(e.reason, (TimeoutError, socket.timeout)):
+            raise SecurityError(f"请求超时（{timeout}s）") from e
+        raise SecurityError(f"请求失败：{e.reason}") from e
+    except TimeoutError as e:
+        raise SecurityError(f"请求超时（{timeout}s）") from e
+    try:
+        peer = _peer_ip(r)
+        if peer:
+            _check_ip(peer, allow_private)
+        yield r
+    finally:
+        try:
+            r.close()
+        except Exception:  # noqa: BLE001 —— 关闭失败无所谓，连接已经断了
+            pass
 
 
 def open_url(

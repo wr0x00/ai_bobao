@@ -43,6 +43,7 @@
  GET  /api/envs               本地复现环境列表（含资产根目录）
  GET  /api/envs/{eid}         环境详情（资产落盘位置）
  POST /api/envs/resolve       只让 LLM 出复现方案，不拉东西
+ POST /api/envs/resolve/stream  方案的流式版（SSE，字段边生成边推）
  POST /api/envs/build         为一条漏洞搭环境（拉程序/源码/镜像，找不到就放弃）
  POST /api/envs/{eid}/start   启动环境
  POST /api/envs/{eid}/stop    停止环境
@@ -51,6 +52,7 @@
  POST /api/update/apply     快进到远端最新（只 --ff-only，不动本地改动）
  GET  /api/session            下发本次会话的写操作令牌
  POST /api/agent/chat         跟内嵌 agent 对话（带 session_id 就把这一轮存进会话）
+ POST /api/agent/chat/stream  agent 对话的流式版（SSE，思考/答复/工具步实时推）
  GET  /api/agent/sessions     会话列表（对话面板左侧栏用）
  POST /api/agent/sessions     新建会话
  GET  /api/agent/sessions/{sid}       读一个会话（含全部消息）
@@ -62,6 +64,7 @@
       每轮抓完按 collect.keep_days 清一次过期漏洞。
 """
 import asyncio
+import json
 import logging
 import re
 import secrets
@@ -74,8 +77,9 @@ import uvicorn
 from fastapi import FastAPI, HTTPException, Path, Query, Request
 from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import FileResponse, JSONResponse, Response
+from fastapi.responses import FileResponse, JSONResponse, Response, StreamingResponse
 from pydantic import BaseModel, Field
+from starlette.concurrency import iterate_in_threadpool
 from starlette.middleware.trustedhost import TrustedHostMiddleware
 
 import agent
@@ -127,6 +131,7 @@ RATE_HEAVY = 10
 # 跑 LLM / git / 联网的重活儿接口，单独最严。它们一次能烧掉真金白银，不能被刷。
 _HEAVY_EXACT = frozenset({
     "/api/agent/chat",
+    "/api/agent/chat/stream",
     "/api/agent/export",
     "/api/collect",
     "/api/nuclei/sync",
@@ -140,6 +145,7 @@ _HEAVY_EXACT = frozenset({
     "/api/vulns/rate",
     "/api/vulns/recheck",
     "/api/envs/resolve",
+    "/api/envs/resolve/stream",
     "/api/envs/build",
 })
 _HEAVY_PREFIX = ("/api/vulns/", "/api/envs/")     # 配合 _HEAVY_SUFFIX 用
@@ -192,14 +198,24 @@ async def _read_body(receive, max_bytes: int) -> list[dict]:
     return messages
 
 
-def _replay(messages: list[dict]):
-    """造一个 receive，把收好的分片原样重放。下游读几次都是同一份数据，读完就说断开。"""
+def _replay(messages: list[dict], receive):
+    """造一个 receive，把收好的分片原样重放。下游读几次都是同一份数据。
+
+    重放完不能直接回 http.disconnect：SSE 这类流式响应在发送期间会一直轮询
+    receive 探测客户端断开，这里若立刻回 disconnect，Starlette 会当场取消
+    整个响应（"ASGI callable returned without completing response"）。
+    所以分片放完之后转交给真实的 receive——既让断开探测正常工作，
+    也保证没有第二个消费者会把同一份数据读两遍。
+    """
     it = iter(messages)
 
-    async def receive():
-        return next(it, {"type": "http.disconnect"})
+    async def recv():
+        msg = next(it, None)
+        if msg is not None:
+            return msg
+        return await receive()
 
-    return receive
+    return recv
 
 
 class ApiGuard:
@@ -252,7 +268,7 @@ class ApiGuard:
             await _reject(send, 413, f"请求体过大，上限 {security.MAX_BODY // 1024}KB")
             return
 
-        await self.app(scope, _replay(body), send)
+        await self.app(scope, _replay(body, receive), send)
 
 
 def _constant_eq(a: str, b: str) -> bool:
@@ -998,6 +1014,30 @@ def api_del_source(name: str = Path(max_length=MAX_SOURCE_LEN)):
         raise HTTPException(e.status, e.message) from e
 
 
+# ── SSE 流式响应 ─────────────────────────────────────────
+def _sse_response(sync_gen, errors: tuple = (Exception,)):
+    """把同步事件生成器包成 SSE 响应：每帧 data: {json}\\n\\n。
+
+    同步生成器的每次 next() 都扔线程池跑——里面是阻塞的 socket 读，
+    直接在事件循环里迭代会把整个后端卡住（轮询、静态页全都跟着僵住）。
+    errors 里列的异常转成 {"type": "error"} 帧推给前端（str(e) 已是人话）；
+    其余异常记日志后推通用错误帧。前端断开时 Starlette 会收掉生成器。
+    """
+    async def gen():
+        try:
+            async for ev in iterate_in_threadpool(sync_gen):
+                yield f"data: {json.dumps(ev, ensure_ascii=False)}\n\n"
+        except errors as e:
+            yield f"data: {json.dumps({'type': 'error', 'message': str(e)}, ensure_ascii=False)}\n\n"
+        except Exception:
+            logger.exception("SSE 流异常")
+            yield f"data: {json.dumps({'type': 'error', 'message': '服务异常，请查看后端日志'}, ensure_ascii=False)}\n\n"
+
+    return StreamingResponse(gen(), media_type="text/event-stream",
+                             headers={"Cache-Control": "no-store",
+                                      "X-Accel-Buffering": "no"})
+
+
 # ── 本地复现环境 ──────────────────────────────────────────
 @app.get("/api/envs")
 def api_list_envs():
@@ -1028,6 +1068,26 @@ async def api_resolve_env(req: EnvReq):
     except lab_env.EnvError as e:
         raise HTTPException(e.status, e.message) from e
     return {"ok": True, "plan": plan}
+
+
+@app.post("/api/envs/resolve/stream")
+async def api_resolve_env_stream(req: EnvReq):
+    """「先看方案」流式版：方案字段一边生成一边推给前端。
+
+    事件：{"type": "field", "field", "text"} 逐字段播报 →
+          {"type": "done", "plan"} 完整方案 →
+          {"type": "error", "message"} 失败原因。
+    模型一直在后台干活，前端从第一秒起就能看到方案逐字成形，没有「干等 60 秒」。
+    """
+    try:
+        vid = security.require_vid(req.vid)
+    except security.SecurityError as e:
+        raise HTTPException(400, str(e)) from e
+
+    def gen():
+        yield from lab_env.plan_env_stream(vid)
+
+    return _sse_response(gen(), (lab_env.EnvError,))
 
 
 @app.post("/api/envs/build")
@@ -1095,18 +1155,12 @@ def api_delete_env(eid: str = Path(max_length=32)):
 
 
 # ── AI Agent 对话 ────────────────────────────────────────
-@app.post("/api/agent/chat")
-async def api_agent_chat(req: AgentChatReq):
-    """跟内嵌 agent 说一句话。阻塞的 LLM 往返扔线程池。
-    工具会在 agent 模块里就地执行（改配置/查库/导出），返回答复与操作轨迹。
+def _agent_chat_prepare(req: AgentChatReq) -> tuple[str, str, list[dict], dict]:
+    """api_agent_chat / api_agent_chat_stream 共用的入参准备。
 
-    带 session_id 时走会话模式：历史从服务端会话文件里取，本轮问答回写进文件，
-    刷新页面、换标签页都还在。不带 session_id 是一次性问答（老行为）。
+    返回 (last_user, sid, history, opts)。会话模式历史以服务端文件为准，
+    前端带来的旧消息不用；参数越界的就地收到安全范围。
     """
-    if not req.messages:
-        raise HTTPException(400, "对话内容为空")
-
-    # 本轮用户说的话：取最后一条 user 消息
     last_user = ""
     for m in reversed(req.messages):
         if m.role == "user":
@@ -1123,7 +1177,6 @@ async def api_agent_chat(req: AgentChatReq):
             raise HTTPException(400, str(e)) from e
 
     if sid:
-        # 会话模式：历史以服务端文件为准，前端带来的旧消息不用
         sess = agent_sessions.get_session(sid) or {}
         history = [{"role": m["role"], "content": m["content"]}
                    for m in sess.get("messages", [])
@@ -1144,6 +1197,20 @@ async def api_agent_chat(req: AgentChatReq):
         "max_tokens": (None if not req.max_tokens or req.max_tokens <= 0
                        else min(req.max_tokens, 32000)),
     }
+    return last_user, sid, history, opts
+
+
+@app.post("/api/agent/chat")
+async def api_agent_chat(req: AgentChatReq):
+    """跟内嵌 agent 说一句话。阻塞的 LLM 往返扔线程池。
+    工具会在 agent 模块里就地执行（改配置/查库/导出），返回答复与操作轨迹。
+
+    带 session_id 时走会话模式：历史从服务端会话文件里取，本轮问答回写进文件，
+    刷新页面、换标签页都还在。不带 session_id 是一次性问答（老行为）。
+    """
+    if not req.messages:
+        raise HTTPException(400, "对话内容为空")
+    last_user, sid, history, opts = _agent_chat_prepare(req)
 
     try:
         result = await asyncio.to_thread(agent.run_chat, history, req.ui, opts)
@@ -1160,6 +1227,36 @@ async def api_agent_chat(req: AgentChatReq):
                                       result.get("reply", ""), result.get("steps"))
         result["session_id"] = sid
     return result
+
+
+@app.post("/api/agent/chat/stream")
+async def api_agent_chat_stream(req: AgentChatReq):
+    """agent 对话流式版：思考、答复、工具步逐个事件推给前端，不等整轮结束。
+
+    事件：{"type": "text", "field": "thought"|"final", "text"} 增量文字 →
+          {"type": "step", "step"} 工具执行完一步 →
+          {"type": "done", "reply", "steps", "sent"}（带 session_id）→
+          {"type": "error", "message"} 失败原因。
+    模型吐一个字就推一个字，不再「转圈几十秒后整段蹦出来」。
+    """
+    if not req.messages:
+        raise HTTPException(400, "对话内容为空")
+    last_user, sid, history, opts = _agent_chat_prepare(req)
+
+    def gen():
+        final: dict | None = None
+        for ev in agent.run_chat_stream(history, req.ui, opts):
+            if ev.get("type") == "done":
+                final = ev
+                if sid:
+                    ev = {**ev, "session_id": sid}
+            yield ev
+        if sid and final:
+            agent_sessions.append_message(sid, "user", last_user)
+            agent_sessions.append_message(sid, "assistant",
+                                          final.get("reply", ""), final.get("steps"))
+
+    return _sse_response(gen(), (ValueError, RuntimeError))
 
 
 # ── AI Agent 会话历史 ────────────────────────────────────

@@ -155,7 +155,7 @@
 import { computed, nextTick, ref, watch } from 'vue'
 import { useRoute } from 'vue-router'
 import {
-    agentChat, clearSession, createSession, deleteSession, downloadAgentExport,
+    agentChatStream, clearSession, createSession, deleteSession, downloadAgentExport,
     getSession, listSessions, renameSession,
 } from './api'
 
@@ -441,7 +441,8 @@ function chatOpts() {
     }
 }
 
-/** 发一句话给 agent。历史存在后端，前端只带这一句。 */
+/** 发一句话给 agent。历史存在后端，前端只带这一句。
+ *  流式版：思考/答复逐字上屏，工具每执行一步追加一行，done 后换成干净的最终答复。 */
 async function ask(text) {
     if (pending.value) return
     if (!curId.value) await newSession()
@@ -450,14 +451,38 @@ async function ask(text) {
     msgs.value.push({ role: 'user', content: body })
     pending.value = true
     try {
-        const r = await agentChat([{ role: 'user', content: body }], uiContext(), curId.value, chatOpts())
-        msgs.value.push({
-            role: 'assistant',
-            content: r.reply || '（空回复）',
-            steps: stepsView(r.steps),
+        // 先占一条消息，事件到了往里追加；从数组取回的是响应式代理，改字段即生效
+        msgs.value.push({ role: 'assistant', content: '' })
+        const live = msgs.value[msgs.value.length - 1]
+        let lastField = ''
+        let streamErr = ''
+        await agentChatStream([{ role: 'user', content: body }], uiContext(), curId.value,
+            chatOpts(), (ev) => {
+            if (ev.type === 'text') {
+                if (ev.reset) {
+                    const marker = ev.field === 'thought' ? '〔思考〕' : '〔答复〕'
+                    const mi = live.content.lastIndexOf(marker)
+                    if (mi >= 0) live.content = live.content.slice(0, mi + marker.length)
+                }
+                if (ev.field !== lastField) {
+                    live.content += (live.content ? '\n' : '') +
+                        (ev.field === 'thought' ? '〔思考〕' : '〔答复〕')
+                    lastField = ev.field
+                }
+                live.content += ev.text
+            } else if (ev.type === 'step') {
+                live.content += `\n〔已执行〕${ev.step.tool}：${ev.step.out}`
+                lastField = ''
+            } else if (ev.type === 'done') {
+                live.content = ev.reply
+                live.steps = stepsView(ev.steps)
+                if (ev.session_id) curId.value = ev.session_id
+                if (ev.sent) sent.value = ev.sent
+            } else if (ev.type === 'error') {
+                streamErr = ev.message
+            }
         })
-        // 后端回带这一轮真正发出去的请求体，右下角照着显示
-        if (r.sent) sent.value = r.sent
+        if (streamErr) msgs.value.push({ role: 'fail', error: streamErr })
         await refreshList()
     } catch (e) {
         msgs.value.push({ role: 'fail', error: e.message })
@@ -544,7 +569,8 @@ button { border: 0; border-radius: 0; cursor: pointer; font-size: 12.5px; }
           border-radius: 10px 10px 2px 10px; padding: 8px 12px; }
 .row.ai { align-self: flex-start; display: flex; flex-direction: column; gap: 6px; max-width: 100%; }
 .row.ai .bubble { background: #171a21; border: 1px solid #262b36; color: #e6e6e6;
-                  border-radius: 10px 10px 10px 2px; padding: 8px 12px; }
+                  border-radius: 10px 10px 10px 2px; padding: 8px 12px;
+                  white-space: pre-wrap; word-break: break-word; }
 .row.fail { align-self: stretch; max-width: 100%; color: #f87171; background: #2a1215;
             border: 1px solid #7f1d1d; border-radius: 8px; padding: 8px 12px; font-size: 12.5px; }
 .wait { color: #8b93a1; font-size: 12.5px; }

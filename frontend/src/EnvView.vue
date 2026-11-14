@@ -178,8 +178,8 @@ defineOptions({ name: 'EnvView' })
 
 import { computed, nextTick, onMounted, ref, watch } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
-import { agentChat, buildEnv, clearSession, createSession, delEnv, downloadAgentExport,
-         genPoc, getEnv, listEnvs, resolveEnv, startEnv, stopEnv, verifyEnv } from './api'
+import { agentChatStream, buildEnv, clearSession, createSession, delEnv, downloadAgentExport,
+         genPoc, getEnv, listEnvs, resolveEnvStream, startEnv, stopEnv, verifyEnv } from './api'
 
 const route = useRoute()
 const router = useRouter()
@@ -315,7 +315,9 @@ function planNarrate(p) {
   }
 }
 
-/** 只出方案，不拉东西。先看看 LLM 打算搭什么再决定要不要真搭。 */
+/** 只出方案，不拉东西。先看看 LLM 打算搭什么再决定要不要真搭。
+ *  流式版：模型每生成一个方案字段就实时播报进 AI 框，不再整段等完——
+ *  「LLM 不可用：请求超时」那种干等不存在了，模型在后台写的每个字都看得见。 */
 async function doResolve() {
   if (!vid.value.trim()) { error.value = '先填漏洞 ID'; return }
   busy.value = true
@@ -324,26 +326,43 @@ async function doResolve() {
   aiSay('sys', `正在把漏洞 ${vid.value.trim()} 交给 LLM 规划复现方案（判断组件/版本、从哪拿程序本体、要占多少磁盘）…`)
   const ctrl = new AbortController()
   resolveCtrl = ctrl
-  // 最多等 200 秒：服务端单次 60 秒、超时还重试两次，兜住整轮。
-  // 再久用户就该以为页面死了，不如早点报失败让人重试。
-  const timer = setTimeout(() => ctrl.abort('timeout'), 200000)
+  // 流式下模型持续有输出，连接一直是活的，不做定时强杀；
+  // 想中途停就点「拒绝，暂停」（AbortController 照样能掐）。
+  aiMsgs.value.push({ role: 'assistant', content: '' })
+  const live = aiMsgs.value[aiMsgs.value.length - 1]
+  const FIELD_NAMES = { component: '组件', version: '版本', device: '受影响设备',
+                        source: '来源方式', image: '镜像', repo: '源码仓库',
+                        ref: '仓库分支', release: '发布包直链',
+                        size_estimate: '磁盘预估', reason: '判断理由' }
+  let streamErr = ''
   try {
-    const r = await resolveEnv(vid.value.trim(), { signal: ctrl.signal })
-    plan.value = r.plan
-    planNarrate(r.plan)
+    await resolveEnvStream(vid.value.trim(), (ev) => {
+      if (ev.type === 'field') {
+        // 同一字段反复更新时整行替换，别越滚越长
+        const name = FIELD_NAMES[ev.field] || ev.field
+        const line = `〔${name}〕${ev.text}`
+        const lines = live.content ? live.content.split('\n') : []
+        const i = lines.findIndex((l) => l.startsWith(`〔${name}〕`))
+        if (i >= 0) lines[i] = line; else lines.push(line)
+        live.content = lines.join('\n')
+        nextTick(() => aiBox.value?.scrollTo({ top: aiBox.value.scrollHeight }))
+      } else if (ev.type === 'done') {
+        plan.value = ev.plan
+        planNarrate(ev.plan)
+      } else if (ev.type === 'error') {
+        streamErr = ev.message
+      }
+    }, { signal: ctrl.signal })
+    if (streamErr) throw new Error(streamErr)
   } catch (e) {
     if (ctrl.signal.aborted) {
       // 用户点的「拒绝，暂停」不算出错，别拿红色报错吓人
-      if (ctrl.signal.reason === 'timeout') {
-        error.value = '规划超时（LLM 200 秒没回），点「先看方案」重试'
-        aiSay('sys', '规划超时了，已放弃这次规划。点「先看方案」可以重试。')
-      }
+      aiSay('sys', '已暂停规划。想重新规划随时再点「先看方案」。')
     } else {
       error.value = e.message
       aiSay('sys', `规划失败：${e.message}`)
     }
   } finally {
-    clearTimeout(timer)
     if (resolveCtrl === ctrl) resolveCtrl = null
     busy.value = false
   }
@@ -514,7 +533,9 @@ function stepsView(steps) {
   }))
 }
 
-/** 发一句话给 agent。会话懒创建，历史存服务端，切页面回来还在。 */
+/** 发一句话给 agent。会话懒创建，历史存服务端，切页面回来还在。
+ *  流式版：模型吐字实时上屏（〔思考〕/〔答复〕），工具每执行一步就追加一行，
+ *  收到 done 后用最终答复替换成干净版本。不再「转圈几十秒整段蹦出来」。 */
 async function aiAsk(text = '') {
   const t = String(text || aiDraft.value || '').trim()
   if (!t || aiPending.value) return
@@ -527,9 +548,43 @@ async function aiAsk(text = '') {
       aiSid.value = s.id
     }
     const ui = `本地复现环境页（/envs）${vid.value ? `，当前漏洞：${vid.value}` : ''}`
-    const r = await agentChat([{ role: 'user', content: t }], ui, aiSid.value)
-    aiSent.value = r.sent || null
-    aiSay('assistant', r.reply || '（空回复）', stepsView(r.steps))
+    // 先占一条消息，事件到了往里追加；拿数组最后一项拿到的是响应式代理，
+    // 直接改它的字段界面就会跟着动
+    aiMsgs.value.push({ role: 'assistant', content: '' })
+    const live = aiMsgs.value[aiMsgs.value.length - 1]
+    let lastField = ''
+    let streamErr = ''
+    await agentChatStream([{ role: 'user', content: t }], ui, aiSid.value, {}, (ev) => {
+      if (ev.type === 'text') {
+        if (ev.reset) {
+          // 值回缩（理论上的兜底路径）：截回该字段标记处再重写
+          const marker = ev.field === 'thought' ? '〔思考〕' : '〔答复〕'
+          const mi = live.content.lastIndexOf(marker)
+          if (mi >= 0) live.content = live.content.slice(0, mi + marker.length)
+        }
+        if (ev.field !== lastField) {
+          live.content += (live.content ? '\n' : '') +
+            (ev.field === 'thought' ? '〔思考〕' : '〔答复〕')
+          lastField = ev.field
+        }
+        live.content += ev.text
+        nextTick(() => aiBox.value?.scrollTo({ top: aiBox.value.scrollHeight }))
+      } else if (ev.type === 'step') {
+        live.content += `\n〔已执行〕${ev.step.tool}：${ev.step.out}`
+        lastField = ''                      // 下一轮思考再进来时重新打标记
+        nextTick(() => aiBox.value?.scrollTo({ top: aiBox.value.scrollHeight }))
+      } else if (ev.type === 'done') {
+        // 最终答复替换流式草稿（工具轮的思考过程不用留在正文里）
+        live.content = ev.reply
+        live.steps = stepsView(ev.steps)
+        if (ev.session_id) aiSid.value = ev.session_id
+        aiSent.value = ev.sent || null
+        nextTick(() => aiBox.value?.scrollTo({ top: aiBox.value.scrollHeight }))
+      } else if (ev.type === 'error') {
+        streamErr = ev.message
+      }
+    })
+    if (streamErr) aiSay('fail', `出错了：${streamErr}`)
   } catch (e) {
     aiSay('fail', `出错了：${e.message}`)
   } finally {
@@ -776,7 +831,8 @@ input { background: #171a21; color: #e6e6e6; border: 1px solid #262b36; border-r
 .airow.ai { align-self: flex-start; display: flex; flex-direction: column;
   gap: 6px; max-width: 100%; }
 .aibubble { background: #171a21; border: 1px solid #262b36; color: #e6e6e6;
-  border-radius: 10px 10px 10px 2px; padding: 8px 12px; }
+  border-radius: 10px 10px 10px 2px; padding: 8px 12px; white-space: pre-wrap;
+  word-break: break-word; }
 .airow.sys { align-self: stretch; max-width: 100%; color: #8b93a1; font-size: 12.5px; }
 .airow.sys::before { content: '▸ '; color: #4b5563; }
 .airow.fail { align-self: stretch; max-width: 100%; color: #f87171; background: #2a1215;
