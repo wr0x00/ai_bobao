@@ -33,27 +33,38 @@ All vulnerability data comes from public channels (forums, communities, etc.).
 
 ## Stack
 
-Frontend / backend split. Python 3.11 · FastAPI · Vue 3 · Vite
+Monolithic (single process, single port). Python 3.11 · FastAPI · Vue 3 · Vite
 
 ## Quick Start
 
 ```bash
-# 1. Configure
+# 1. Configure and install dependencies
 cd backend
 cp config.example.yaml config.yaml
 # Edit config.yaml and set your LLM endpoint and API key (AI features stay disabled without them)
+pip install -r requirements.txt
 
-# 2. Backend (default port 8100)
-pip install fastapi uvicorn pyyaml feedparser
+# 2. Run (page + API in one process, one port)
 python main.py
-
-# 3. Frontend
-cd ../frontend
-npm install
-npm run dev        # http://localhost:5173
 ```
 
-The backend listens on `http://localhost:8100`. Open `http://localhost:5173` for the web console.
+Open `http://127.0.0.1:8100` — both the UI and the API live on that single port.
+
+> **Works out of the box**: the built frontend assets (`backend/static/`) ship with the repository.
+> Clone it and run — **no Node, no `npm install`, no `npm run build`**. All you need is
+> Python 3.11+ and one `pip install`.
+>
+> **Monolithic deployment**: FastAPI serves the built assets in `backend/static` directly.
+> Every frontend request is a relative `/api/...` path, so it is same-origin by construction —
+> no separate vite dev server, no CORS, no "the two services disagree on the port" class of bugs.
+> Deep links (`/envs`, `/vuln/<id>`, …) fall back to `index.html` and are handed to the client-side
+> router, so a hard refresh never 404s.
+>
+> **Frontend developers**: the source still lives in `frontend/`. After changing it, run
+> `cd frontend && npm install && npm run build` — the new assets overwrite `backend/static/`
+> (commit them along with the source). For hot reload during development you can use
+> `cd frontend && npm run dev` (port 5173, proxying `/api` to the backend); use the single-process
+> mode above for actual runs.
 
 ---
 
@@ -205,6 +216,7 @@ backend/
   security.py     Outbound security gateway (SSRF guard, hardened XML, rate limiting)
   updater.py      Self-update: check GitHub for a new release and fast-forward
   data/           Runtime data (git-ignored)
+  static/         Frontend build output (shipped with the repo, served by the backend — works out of the box)
 frontend/
   src/
     ListView.vue      Vulnerability list (overview panel above the search bar)
@@ -214,6 +226,7 @@ frontend/
     TemplatesView.vue Template library
     SettingsView.vue  Online settings
     EnvView.vue       Reproduction environments (list / target URL / site preview / update-PoC / pinned AI panel)
+  vite.config.js Build config: outDir points at ../backend/static
 ```
 
 ## Pipeline

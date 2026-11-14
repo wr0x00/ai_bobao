@@ -1,6 +1,8 @@
 """main.py —— FastAPI 入口
 
 启动：cd backend && python main.py   （或 uvicorn main:app --port 8100）
+     前端构建产物要放在 backend/static（cd frontend && npm run build），
+     前后端不分离：一个进程既发页面又发接口，都是 8100 端口。
 
 这个文件干三件事：对外暴露 HTTP 接口、给接口套上安全护栏、跑定时任务。
 真正的业务逻辑都在 analyzer / store / nuclei_tpl 这些模块里，这里不重复写。
@@ -61,6 +63,7 @@
 """
 import asyncio
 import logging
+import re
 import secrets
 import threading
 import time
@@ -71,7 +74,7 @@ import uvicorn
 from fastapi import FastAPI, HTTPException, Path, Query, Request
 from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import JSONResponse, Response
+from fastapi.responses import FileResponse, JSONResponse, Response
 from pydantic import BaseModel, Field
 from starlette.middleware.trustedhost import TrustedHostMiddleware
 
@@ -1257,11 +1260,145 @@ async def api_update_apply():
     return await asyncio.to_thread(updater.apply)
 
 
+# ── 前端静态资源（前后端不分离）──────────────────────────────
+# vite build 的产物落在 backend/static，由后端自己发出去：页面和接口同源同端口，
+# 不用再单独起 vite dev server。前端 api.js 里全是相对路径 /api/...，天然同源，
+# 也不会有跨域和"两个服务端口不一致"这类问题。
+#
+# vue-router 用的是 history 模式（createWebHistory），/envs、/vuln/xxx 这些深链
+# 在磁盘上并没有对应文件，直接刷新就是 404。所以非 /api 的未知路径一律回落 index.html，
+# 让前端路由自己接管。
+_STATIC_DIR = config.STATIC_DIR
+_INDEX = _STATIC_DIR / "index.html"
+
+# 页面 CSP 里的 frame-src 要按运行时实际 IP 生成，所以不能只靠构建产物里写死的那份。
+# CSP 的 host-source 不支持 CIDR 网段（http://192.168.0.0/16 是无效写法，浏览器会当成
+# 一个陌生主机名直接拒掉），只能写精确主机 + 端口通配。
+_CSP_META_RE = re.compile(
+    r'(<meta\s+http-equiv="Content-Security-Policy"\s+content=")([^"]*)(")',
+    re.IGNORECASE,
+)
+
+
+def _frame_src_sources() -> str:
+    """iframe 允许嵌入的来源列表。
+
+    复现环境页要把本地靶站（容器映射出来的端口）嵌进 iframe 预览。靶站端口是
+    随机高位端口，所以端口要带 *；对局域网开放时，本机所有 IPv4 都要放行。
+    """
+    hosts = ["'self'", "http://127.0.0.1:*", "http://localhost:*"]
+    if security.lan_enabled():
+        # 对局域网开放时靶站地址会换成对外 IP（见 lab_env._display_url），
+        # iframe 要能嵌它。本机所有 IPv4 都列上，端口用 *（容器端口是随机高位端口）。
+        for ip in security.local_ipv4s():
+            hosts.append(f"http://{ip}:*")
+    return " ".join(hosts)
+
+
+def _patch_csp(html: str) -> str:
+    """按运行时实际 IP 改写页面 CSP 的 frame-src。
+
+    meta 里的 CSP 与响应头 CSP 是叠加生效的，放开来源只能改 meta 这侧。
+    """
+    sources = _frame_src_sources()
+
+    def _repl(m: re.Match) -> str:
+        csp = re.sub(r"frame-src\s+[^;]*", f"frame-src {sources}", m.group(2))
+        return m.group(1) + csp + m.group(3)
+
+    return _CSP_META_RE.sub(_repl, html, count=1)
+
+
+def _index_response() -> Response:
+    """首页 / SPA 回落。返回前按运行时 IP 改写 CSP 的 frame-src。"""
+    try:
+        html = _INDEX.read_text(encoding="utf-8")
+    except OSError:
+        return Response(_NOT_BUILT_PAGE,
+                        media_type="text/html; charset=utf-8", status_code=503)
+    return Response(_patch_csp(html), media_type="text/html; charset=utf-8",
+                    headers={"Cache-Control": "no-cache"})
+
+_NOT_BUILT_PAGE = """<!doctype html>
+<html lang="zh-CN"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>前端未构建</title>
+<style>
+ body{background:#0f1115;color:#e6e8eb;font:15px/1.7 "Microsoft YaHei",system-ui,sans-serif;
+      display:flex;align-items:center;justify-content:center;min-height:100vh;margin:0}
+ .box{max-width:560px;padding:32px 36px;border:1px solid #262a33;border-radius:14px;background:#151820}
+ h1{margin:0 0 12px;font-size:20px}
+ code{background:#0b0d12;border:1px solid #262a33;border-radius:6px;padding:2px 8px;
+      display:inline-block;font-family:Consolas,monospace;color:#7fd1a0}
+ pre{background:#0b0d12;border:1px solid #262a33;border-radius:8px;padding:14px 16px;
+     font-family:Consolas,monospace;color:#cfd6e4;overflow:auto}
+ p{color:#9aa3b2}
+</style></head>
+<body><div class="box">
+<h1>前端构建产物缺失</h1>
+<p>后端已经在跑了，但 <code>backend/static</code> 里没有构建产物，所以页面出不来。
+   正常情况下这些产物<b>已随仓库附带</b>，克隆下来就能直接用——
+   多半是下载不完整，或者被人删掉了。可以重新拉一份，或自己构建一次：</p>
+<pre>cd frontend
+npm install      # 首次才需要
+npm run build    # 产物落到 backend/static
+cd ../backend
+python main.py</pre>
+<p>然后打开 <code>http://127.0.0.1:8100</code>。</p>
+</div></body></html>
+"""
+
+
+@app.get("/{full_path:path}", include_in_schema=False)
+async def spa(full_path: str):
+    """前端静态资源 + SPA 回落。
+
+    路由必须注册在所有 /api 接口之后，否则接口会被这条 catch-all 抢走。
+    """
+    # /api 下面不存在的接口老老实实回 404 JSON，别给前端吐一坨 HTML。
+    if full_path == "api" or full_path.startswith("api/"):
+        raise HTTPException(404, "接口不存在")
+
+    if not _INDEX.is_file():
+        return Response(_NOT_BUILT_PAGE,
+                        media_type="text/html; charset=utf-8", status_code=503)
+
+    # 拼路径可能带 ../，解析后必须确认还在静态目录里，否则能读到项目任意文件。
+    target = (_STATIC_DIR / full_path).resolve()
+    try:
+        target.relative_to(_STATIC_DIR.resolve())
+    except ValueError:
+        target = None
+    if target is not None and target.is_file():
+        # vite 的 assets 文件名带内容哈希，可以放心长缓存；
+        # index.html 和图标不能长缓存，不然重新构建后用户还拿到旧的。
+        if full_path.startswith("assets/"):
+            headers = {"Cache-Control": "public, max-age=31536000, immutable"}
+        else:
+            headers = {"Cache-Control": "no-cache"}
+        if target == _INDEX.resolve():
+            return _index_response()
+        return FileResponse(target, headers=headers)
+
+    # 深链（/envs、/vuln/xxx…）落回首页，交给 vue-router。
+    return _index_response()
+
+
 if __name__ == "__main__":
     logging.basicConfig(
         level=logging.INFO,
         format="%(asctime)s %(levelname)s %(name)s | %(message)s",
     )
-    # 只绑 127.0.0.1。这个服务没有鉴权体系，暴露到局域网等于把配置和密钥敞开。
+    # 默认只绑 127.0.0.1。这个服务没有鉴权体系，暴露到局域网等于把配置和密钥敞开。
+    # 真要给别人访问，显式设 AI_BAOBAO_HOST=0.0.0.0（这时 Host 白名单会自动
+    # 放行本机的局域网 IP，否则浏览器会被 TrustedHostMiddleware 挡成 400）。
     # 8000 在 Windows 保留端口段内，避开。
-    uvicorn.run(app, host="127.0.0.1", port=8100)
+    host = security.bind_host()
+    port = security.bind_port()
+    if security.lan_enabled():
+        logger.warning(
+            "已对局域网开放：%s:%s，其他机器用 http://%s:%s 访问。"
+            "本服务没有登录鉴权，等于把 LLM 密钥和复现环境资产敞开，请确认网络环境可信。",
+            host, port, security.public_host(), port,
+        )
+    uvicorn.run(app, host=host, port=port)

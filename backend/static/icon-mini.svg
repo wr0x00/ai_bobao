@@ -1,0 +1,45 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512" width="512" height="512" role="img" aria-label="AI 漏洞播报">
+  <!--
+    favicon 专用简化版。
+    大尺寸下雷达环、波纹这些细节都好看，但缩到 16~32 px 就会糊成一团灰。
+    所以这版只留「护盾 + 神经网络节点」这两个最能认出来的东西：
+    轮廓粗、对比强、留白大，缩到最小也还是清晰的盾形。
+  -->
+  <defs>
+    <linearGradient id="bg" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#232c42"/>
+      <stop offset="1" stop-color="#0b0e15"/>
+    </linearGradient>
+    <linearGradient id="blue" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#9ed0ff"/>
+      <stop offset="1" stop-color="#3d7dff"/>
+    </linearGradient>
+    <clipPath id="round">
+      <rect x="0" y="0" width="512" height="512" rx="112"/>
+    </clipPath>
+  </defs>
+
+  <g clip-path="url(#round)">
+    <rect width="512" height="512" fill="url(#bg)"/>
+
+    <!-- 护盾：外描边很粗，缩到 16px 也还有形 -->
+    <g transform="translate(256 262)">
+      <path d="M0 -168 L142 -112 V10 C142 96 82 152 0 182 C-82 152 -142 96 -142 10 V-112 Z"
+            fill="#0d1119" stroke="url(#blue)" stroke-width="30" stroke-linejoin="round"/>
+      <!-- 神经网络：中心大节点 + 四个卫星节点，连线加粗 -->
+      <g stroke="#5aa7ff" stroke-width="18" stroke-linecap="round">
+        <line x1="-56" y1="-58" x2="0" y2="4"/>
+        <line x1="56" y1="-58" x2="0" y2="4"/>
+        <line x1="0" y1="4" x2="-48" y2="76"/>
+        <line x1="0" y1="4" x2="48" y2="76"/>
+      </g>
+      <g>
+        <circle cx="-56" cy="-58" r="27" fill="#9ed0ff"/>
+        <circle cx="56" cy="-58" r="27" fill="#9ed0ff"/>
+        <circle cx="0" cy="4" r="33" fill="#ffffff"/>
+        <circle cx="-48" cy="76" r="24" fill="#f472b6"/>
+        <circle cx="48" cy="76" r="24" fill="#f472b6"/>
+      </g>
+    </g>
+  </g>
+</svg>

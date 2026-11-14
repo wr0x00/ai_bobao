@@ -33,28 +33,35 @@ AI 赋能的漏洞播报系统，AI 根据公开的漏洞思路自动生成 PoC�
 
 ## 技术栈
 
-前后端分离 Python 3.11 · FastAPI · Vue 3 · Vite
+前后端不分离（单进程同端口）Python 3.11 · FastAPI · Vue 3 · Vite
 
 ## 快速开始
 
 ```bash
-# 1. 配置
+# 1. 配置 + 装依赖
 cd backend
 cp config.example.yaml config.yaml
 # 编辑 config.yaml 填入 LLM 端点与 API Key（不填则 AI 相关功能不可用）
+pip install -r requirements.txt
 
-# 2. 后端（默认端口 8100）
-pip install fastapi uvicorn pyyaml feedparser
+# 2. 启动（页面 + 接口同一个进程、同一个端口）
 python main.py
-
-# 3. 前端
-cd ../frontend
-npm install
-npm run dev        # http://localhost:5173
 ```
 
-后端`http://localhost:8100`。
-打开 `http://localhost:5173` 访问 Web UI控制台。
+打开 `http://127.0.0.1:8100`，页面和 API 都在这一个端口上。
+
+> **开箱即用**：前端构建产物（`backend/static/`）已随仓库附带，
+> 克隆下来直接跑，**不需要装 Node、不需要 `npm install`、不需要 `npm run build`**。
+> 仓库里也只要求 Python 3.11+ 与一条 `pip install`。
+>
+> **前后端不分离**：FastAPI 直接托管 `backend/static` 里的构建产物，
+> 前端所有请求都是相对路径 `/api/...`，天然同源——不用再单独起 vite dev server，
+> 也没有跨域和「两个服务端口对不上」的问题。
+> 深链（`/envs`、`/vuln/<id>` 等）刷新会回落到 `index.html` 交给前端路由，不会 404。
+>
+> **前端开发者**：源码仍在 `frontend/`。改完前端后 `cd frontend && npm install && npm run build`
+> 会把新产物覆盖回 `backend/static/`（提交时记得一起带上）；开发调试时可用
+> `cd frontend && npm run dev`（5173 端口，代理 `/api` 到后端）热更新，正式跑请用上面的单进程模式。
 
 ***
 
@@ -182,14 +189,15 @@ curl -X DELETE localhost:8100/api/sources/先知
 flowchart TB
     U["👤 用户（浏览器）"] --> FE
 
-    subgraph FE["🖥️ 前端 Vue 3 · 端口 5173"]
+    subgraph FE["🖥️ 前端 Vue 3 · 构建产物 backend/static"]
       UI["漏洞列表 / 详情 / 图表 / 设置<br>EnvView 复现环境页（靶站地址 + 站点预览 + 更新 PoC）<br>右下角 AI 助手面板 / /envs 页左下角环境 AI 框"]
     end
 
-    FE -- "所有操作都发 HTTP 请求 /api/..." --> BE
+    FE -- "同源相对请求 /api/..." --> BE
 
-    subgraph BE["⚙️ 后端 FastAPI（main.py）· 端口 8100 · 全系统的大脑"]
+    subgraph BE["⚙️ 后端 FastAPI（main.py）· 端口 8100 · 全系统的大脑 · 页面与接口同端口"]
       direction TB
+      SPA["🗂️ 静态托管：backend/static + SPA 深链回落 index.html"]
       API["API 接口：处理前端每一个请求"]
       AGENT["🤖 AI 助手 agent.py<br>查库 / 加源 / 改设置 / 导出<br>搭环境 / 打 PoC / 修环境（工具白名单）"]
       SCH["⏰ 定时闹钟：默认每 10 分钟跑一轮"]
@@ -275,6 +283,7 @@ backend/
   security.py     出站安全网关（SSRF 防护、XML 解析加固、限流）
   updater.py      自更新：查 GitHub 新版本 + 快进合并
   data/           运行时数据（已忽略）
+  static/         前端构建产物（已随仓库附带，后端自己发，开箱即用）
 frontend/
   src/
     ListView.vue      漏洞列表（总览面板嵌在搜索栏上方）
@@ -284,6 +293,7 @@ frontend/
     TemplatesView.vue 模板库
     SettingsView.vue  在线设置
     EnvView.vue       复现环境页（环境列表 / 靶站地址 / 站点预览 / 更新 PoC / 左下角 AI 框）
+  vite.config.js 构建配置：outDir 指向 ../backend/static
 ```
 
 ## 工作流程

@@ -21,6 +21,7 @@ backend/package-lock.json
 # ---- 前端 ----
 frontend/node_modules/
 frontend/dist/
+# backend/static/ 的构建产物随仓库分发，用户 clone 完直接跑，不需要 npm build
 
 # ---- 第三方源码（nuclei 本体，非本项目代码）----
 /nuclei/

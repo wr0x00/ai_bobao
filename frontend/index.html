@@ -8,12 +8,18 @@
       connect-src 里的 ws 是给开发服务器热更新用的。剩下的口子全关：
       object-src 'none' 挡插件类攻击，base-uri 'none' 挡 <base> 劫持相对地址。
       真正的接口响应还由后端再补一层更严的 CSP（/api 是 default-src 'none'）。
+      frame-src 放开回环地址：复现环境页要把本地靶站（127.0.0.1 上的容器端口）嵌进
+      iframe 预览，不放开这个 iframe 会被 default-src 'self' 挡掉。
+      注意：CSP 的 host-source 不支持 CIDR 网段写法（http://192.168.0.0/16 是无效的），
+      只能写精确主机，所以对局域网开放时要放行的 http://192.168.x.x:端口 由后端在返回
+      页面时按运行时实际 IP 追加（见 backend/main.py 的 _patch_frame_src）。
     -->
     <meta
       http-equiv="Content-Security-Policy"
       content="default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline';
                img-src 'self' data:; font-src 'self' data:;
                connect-src 'self' ws://localhost:5173 ws://127.0.0.1:5173;
+               frame-src 'self' http://127.0.0.1:* http://localhost:*;
                object-src 'none'; base-uri 'none'; form-action 'self'"
     />
     <title>AI 漏洞播报系统</title>

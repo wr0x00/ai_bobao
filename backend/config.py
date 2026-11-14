@@ -18,6 +18,7 @@ BASE_DIR = Path(__file__).resolve().parent
 DATA_DIR = BASE_DIR / "data"
 VULN_DIR = DATA_DIR / "vulns"                  # 文件库：每个漏洞一个目录
 CONFIG_FILE = BASE_DIR / "config.yaml"        # 前端设置页写这个文件
+STATIC_DIR = BASE_DIR / "static"              # 前端构建产物：vite build 落到这里，后端自己发
 
 DEFAULTS: dict = {
     "llm": {

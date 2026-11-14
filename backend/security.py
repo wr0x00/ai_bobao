@@ -94,7 +94,75 @@ def cors_origins() -> list[str]:
     raw = os.getenv("AI_BAOBAO_CORS_ORIGINS", "")
     if raw.strip():
         return [x.strip() for x in raw.split(",") if x.strip()]
-    return ["http://localhost:5173", "http://127.0.0.1:5173"]
+    origins = ["http://localhost:5173", "http://127.0.0.1:5173"]
+    if lan_enabled():
+        # 对局域网开放时，前端页面本身可能从别的机器打开，跨域来源要跟着放行
+        for ip in local_ipv4s():
+            origins.append(f"http://{ip}:{bind_port()}")
+    return origins
+
+
+# ── 监听地址与对外可达性 ─────────────────────────────────
+def bind_host() -> str:
+    """服务绑的地址。默认只绑回环，局域网访问要显式设 AI_BAOBAO_HOST=0.0.0.0。"""
+    return os.getenv("AI_BAOBAO_HOST", "127.0.0.1").strip() or "127.0.0.1"
+
+
+def bind_port() -> int:
+    """服务端口。默认 8100。"""
+    raw = os.getenv("AI_BAOBAO_PORT", "8100").strip() or "8100"
+    try:
+        port = int(raw)
+    except ValueError:
+        port = 8100
+    return port if 1 <= port <= 65535 else 8100
+
+
+def lan_enabled() -> bool:
+    """是不是对局域网开放了（绑了非回环地址）。"""
+    return bind_host() not in ("127.0.0.1", "localhost", "::1")
+
+
+def local_ipv4s() -> list[str]:
+    """本机的局域网 IPv4 地址。
+
+    UDP connect 不会真发包，只是让系统选路由，借此拿到出网网卡的地址；
+    再用主机名解析兜一次（VPN、虚拟网卡会让这两种方式给出不同结果）。
+    """
+    found: list[str] = []
+
+    def _add(ip: str) -> None:
+        if ip and not ip.startswith(("127.", "169.254.")) and ip not in found:
+            found.append(ip)
+
+    try:
+        with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as s:
+            s.settimeout(0.3)
+            s.connect(("10.255.255.255", 1))
+            _add(s.getsockname()[0])
+    except OSError:
+        pass
+    try:
+        for info in socket.getaddrinfo(socket.gethostname(), None, socket.AF_INET):
+            _add(info[4][0])
+    except OSError:
+        pass
+    return found
+
+
+def public_host() -> str:
+    """别的机器该用哪个地址访问本机。
+
+    优先用 AI_BAOBAO_PUBLIC_HOST 显式指定；没指定就自己猜局域网 IP；
+    没开放局域网时老老实实给回环。
+    """
+    raw = os.getenv("AI_BAOBAO_PUBLIC_HOST", "").strip()
+    if raw:
+        return raw
+    if not lan_enabled():
+        return "127.0.0.1"
+    ips = local_ipv4s()
+    return ips[0] if ips else "127.0.0.1"
 
 
 def allowed_hosts() -> list[str]:
@@ -102,11 +170,19 @@ def allowed_hosts() -> list[str]:
 
     浏览器发 Host 头是原样发的，陌生主机名直接 400，这一条挡的是 DNS 重绑定：
     攻击者把域名解析到 127.0.0.1，靠这个白名单他连门都进不来。
+
+    对局域网开放时，本机所有 IPv4 都要加进来：同事用 http://192.168.x.x:8100
+    打开时 Host 头就是那个 IP，不放行会被这里直接 400 掉。
     """
     raw = os.getenv("AI_BAOBAO_ALLOWED_HOSTS", "")
     if raw.strip():
         return [x.strip() for x in raw.split(",") if x.strip()]
-    return ["127.0.0.1", "localhost", "testserver"]
+    hosts = ["127.0.0.1", "localhost", "testserver"]
+    if lan_enabled():
+        for ip in local_ipv4s():
+            if ip not in hosts:
+                hosts.append(ip)
+    return hosts
 
 
 # ── IP 判定 ──────────────────────────────────────────────

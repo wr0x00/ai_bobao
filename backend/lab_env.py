@@ -39,7 +39,7 @@ import threading
 import time
 from datetime import UTC, datetime
 from pathlib import Path
-from urllib.parse import urlparse
+from urllib.parse import urlparse, urlunparse
 
 import config
 import net
@@ -146,6 +146,26 @@ def _write_meta(d: Path, meta: dict) -> dict:
     return meta
 
 
+def _display_url(m: dict) -> str:
+    """页面上展示给用户的靶站地址。
+
+    内部记的 target_url 永远是回环地址（PoC 验证、健康检查都走它，不受主机
+    防火墙和网络状况影响），但那个地址别的机器点不开。对局域网开放时，
+    展示地址要换成对外可达的 IP。
+    """
+    u = _target_url(m)
+    if not u:
+        return ""
+    p = urlparse(u)
+    host = p.hostname or "127.0.0.1"
+    if security.lan_enabled():
+        host = security.public_host()
+    if not host:
+        return u
+    netloc = f"{host}:{p.port}" if p.port else host
+    return urlunparse((p.scheme or "http", netloc, p.path or "", p.params, p.query, p.fragment))
+
+
 def _view(m: dict) -> dict:
     """环境条目的对外形状。内部字段（比如落盘绝对路径）只在详情里给。"""
     return {
@@ -171,7 +191,7 @@ def _view(m: dict) -> dict:
         "vulns": list(m.get("vulns") or []),
         "container": str(m.get("container") or ""),
         "pid": int(m.get("pid") or 0),
-        "target_url": str(m.get("target_url") or ""),
+        "target_url": _display_url(m),
         "verify": m.get("verify") if isinstance(m.get("verify"), dict) else None,
         "created_at": str(m.get("created_at") or ""),
         "updated_at": str(m.get("updated_at") or ""),
