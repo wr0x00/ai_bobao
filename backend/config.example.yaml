@@ -23,3 +23,52 @@ nuclei:
   gen_templates: true               # 为收录漏洞生成 nuclei 模板
   sync_enabled: true                # 定时任务自动同步模板库增量
   sync_limit: 0                     # 单次同步最多入库几条，0 = 不限
+sources:
+  custom:
+  - name: 安全客
+    url: https://api.anquanke.com/rss
+    enabled: true
+  - name: 360CERT
+    url: https://cert.360.cn/feed
+    enabled: true
+  - name: 腾讯玄武
+    url: https://xlab.tencent.com/cn/feed/
+    enabled: true
+  - name: 天融信
+    url: https://blog.topsec.com.cn/feed
+    enabled: true
+  - name: watchTowr
+    url: https://labs.watchtowr.com/feed
+    enabled: true
+  - name: 0daylabs
+    url: https://blog.0daylabs.com/feed.xml
+    enabled: true
+  - name: CrowdFense
+    url: https://www.crowdfense.com/blog/feed/
+    enabled: true
+  - name: Unit42
+    url: https://unit42.paloaltonetworks.com/feed/
+    enabled: true
+  - name: CISA漏洞通告
+    url: https://www.cisa.gov/cybersecurity-advisories/all.xml
+    enabled: true
+  - name: Exodus
+    url: https://blog.exodusintel.com/feed/
+    enabled: true
+  - name: huntr
+    url: https://blog.huntr.com/feed
+    enabled: true
+  - name: PortSwigger
+    url: https://portswigger.net/research/rss
+    enabled: true
+  - name: Cisco Talos
+    url: https://blog.talosintelligence.com/rss/
+    enabled: true
+  - name: 补天漏洞分析
+    url: https://forum.butian.net/community/Vul_analysis/newest
+    enabled: true
+
+lab:
+  root: ''
+  docker_enabled: true
+  timeout: 600
